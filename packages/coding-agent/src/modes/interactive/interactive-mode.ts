@@ -6019,12 +6019,7 @@ export class InteractiveMode {
 		}
 	}
 
-	/**
-	 * Spec 10.5/10.6: "/memory flush [instructions]" and "/memory undo <id>" (optionally "/memory undo
-	 * global <id>" for the global file; project is the default scope, matching Memory.scope.default).
-	 * The underlying capabilities (AgentSession.flushMemoryNow, MemoryStore.undo) already exist and are
-	 * unconditionally available — this is purely the command-surface wiring for them.
-	 */
+	/** Project memory commands backed by the v2 authority. */
 	private async handleMemoryCommand(text: string): Promise<void> {
 		const rest = text.replace(/^\/memory\s*/, "").trim();
 		const spaceIndex = rest.indexOf(" ");
@@ -6032,17 +6027,21 @@ export class InteractiveMode {
 		const args = spaceIndex === -1 ? "" : rest.slice(spaceIndex + 1).trim();
 
 		if (!subcommand || subcommand === "flush") {
-			this.showStatus("Flushing durable facts to project memory\u2026");
+			if (args) {
+				this.showWarning("Usage: /memory flush");
+				return;
+			}
+			this.showStatus("Checking closed evidence for project memory\u2026");
 			try {
-				const result = await this.session.flushMemoryNow(args || undefined);
-				if (!result.attempted) {
-					this.showWarning(result.warning ?? "Nothing to flush yet.");
+				const result = await this.session.flushMemoryNow();
+				if (result.status === "deferred" || result.status === "disabled") {
+					this.showWarning(result.warning ?? result.reasons.join(", "));
 				} else if (result.written > 0) {
 					this.showStatus(
-						`Wrote ${result.written} memory entr${result.written === 1 ? "y" : "ies"} to project memory.`,
+						`Archive ${result.jobId} wrote ${result.written} memory entr${result.written === 1 ? "y" : "ies"}.`,
 					);
 				} else {
-					this.showWarning(result.warning ?? "No durable facts were found to remember.");
+					this.showStatus(`Archive ${result.jobId} processed; no durable facts were accepted.`);
 				}
 			} catch (error) {
 				this.showError(`Memory flush failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -6050,31 +6049,39 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (subcommand === "undo") {
-			let scope: "project" | "global" = "project";
-			let id = args;
-			if (args.startsWith("global ")) {
-				scope = "global";
-				id = args.slice(7).trim();
-			} else if (args.startsWith("project ")) {
-				id = args.slice(8).trim();
-			}
-			if (!id) {
-				this.showWarning("Usage: /memory undo <id> (or /memory undo global <id> for the global file)");
+		if (subcommand === "remember") {
+			if (!args) {
+				this.showWarning("Usage: /memory remember <project rule>");
 				return;
 			}
-			const undone = this.session.memoryStore.undo(
-				scope,
-				scope === "project" ? this.sessionManager.getCwd() : undefined,
-				id,
-			);
+			try {
+				const record = this.session.rememberMemoryRule(args);
+				this.showStatus(`Remembered ${record.memoryId}@${record.revision}.`);
+			} catch (error) {
+				this.showError(`Memory remember failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
+
+		if (subcommand === "status") {
+			const status = this.session.getMemoryStatus();
 			this.showStatus(
-				undone ? `Undid memory entry "${id}" (${scope}).` : `No ${scope} memory entry found with id "${id}".`,
+				`Memory: ${status.activeRecords} active, ${status.unverifiedRecords} unverified, ${status.deferredCandidates} deferred, ${status.unprocessedSources} sources pending; jobs ${status.jobs.queued} queued/${status.jobs.running} running/${status.jobs.waiting_budget} budget wait/${status.jobs.needs_review} review${status.nextSchedulableAt ? `; retry ${status.nextSchedulableAt}` : ""}${status.derivedViewStale ? "; derived view stale" : ""}.`,
 			);
 			return;
 		}
 
-		this.showWarning("Usage: /memory flush [instructions] | /memory undo <id>");
+		if (subcommand === "undo") {
+			if (!args) {
+				this.showWarning("Usage: /memory undo <memoryId>");
+				return;
+			}
+			const undone = this.session.revokeMemory(args);
+			this.showStatus(undone ? `Revoked memory record "${args}".` : `No memory record found with id "${args}".`);
+			return;
+		}
+
+		this.showWarning("Usage: /memory remember <rule> | /memory flush | /memory status | /memory undo <memoryId>");
 	}
 
 	stop(): void {

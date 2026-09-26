@@ -10,21 +10,25 @@
  * run long after both modules have finished their initial (synchronous) evaluation.
  */
 
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { AgentSession } from "../agent-session.ts";
+import type { ExecutionUpgradeConfig, ExecutionUpgradeOutcome } from "../execution-upgrade.ts";
 import { convertToLlm } from "../messages.ts";
 import type { ModelRuntime } from "../model-runtime.ts";
 import type { ResourceLoader } from "../resource-loader.ts";
 import { SessionManager } from "../session-manager.ts";
 import type { SettingsManager } from "../settings-manager.ts";
 import type { WebSearchOperations } from "../tools/web-search.ts";
+import { createTraceRequestHeader, type TraceRequestHeader } from "../trace.ts";
 import type { BlockedSubagentSubmission, CompletedSubagentSubmission } from "./protocol.ts";
 import { createSubagentSubmissionChannel, SUBMIT_SUBAGENT_RESULT_TOOL_NAME } from "./submit-result-tool.ts";
 
 export interface ChildAgentSessionDeps {
 	cwd: string;
 	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	executionUpgrade: ExecutionUpgradeConfig;
 	modelRuntime: ModelRuntime;
 	resourceLoader: ResourceLoader;
 	settingsManager: SettingsManager;
@@ -50,6 +54,7 @@ function createChildAgentSession(
 	const agent = new Agent({
 		initialState: {
 			model: deps.model,
+			thinkingLevel: deps.thinkingLevel,
 			systemPrompt: deps.systemPrompt,
 			tools: [],
 		},
@@ -63,6 +68,7 @@ function createChildAgentSession(
 		// sessions. Their result is surfaced to the parent via the TaskManager output buffer instead.
 		sessionManager: SessionManager.inMemory(),
 		settingsManager: deps.settingsManager,
+		executionUpgrade: deps.executionUpgrade,
 		cwd: deps.cwd,
 		modelRuntime: deps.modelRuntime,
 		resourceLoader: deps.resourceLoader,
@@ -80,6 +86,8 @@ export interface RunPiChildAgentOptions {
 	deps: ChildAgentSessionDeps;
 	prompt: string;
 	signal: AbortSignal;
+	onUpgrade?: (outcome: ExecutionUpgradeOutcome, sessionId: string, promptGeneration: number) => void;
+	onRequest?: (header: TraceRequestHeader, sessionId: string, promptGeneration: number) => void;
 }
 
 export type RunPiChildAgentResult =
@@ -95,17 +103,35 @@ export type RunPiChildAgentResult =
 export async function runPiChildAgent(options: RunPiChildAgentOptions): Promise<RunPiChildAgentResult> {
 	const submissionChannel = createSubagentSubmissionChannel();
 	const session = createChildAgentSession(options.deps, submissionChannel);
+	session.subscribe((event) => {
+		if (event.type === "execution_upgrade")
+			options.onUpgrade?.(
+				event.outcome,
+				session.sessionId,
+				session.sessionManager.getLatestContextCoordinates().promptGeneration,
+			);
+	});
+	const unsubscribeRequest = session.agent.subscribe((event) => {
+		if (event.type === "request_start")
+			options.onRequest?.(
+				createTraceRequestHeader(event),
+				session.sessionId,
+				session.sessionManager.getLatestContextCoordinates().promptGeneration,
+			);
+	});
 	const onAbort = () => session.agent.abort();
 	if (options.signal.aborted) onAbort();
 	options.signal.addEventListener("abort", onAbort);
 	try {
 		await session.prompt(options.prompt);
 		const state = session.agent.state.runState;
-		if (state.status === "idle" && state.lastOutcome?.type === "context_limit") {
+		if (state.status === "idle" && state.lastOutcome && state.lastOutcome.type !== "completed") {
+			const outcome = state.lastOutcome;
 			return {
-				status: "failed",
-				errorCode: "execution_failed",
-				errorMessage: "context_limit: insufficient context to submit a result",
+				status: outcome.type === "aborted" ? "cancelled" : "failed",
+				errorCode: outcome.type === "aborted" ? "cancelled" : "execution_failed",
+				errorMessage:
+					"message" in outcome && outcome.message ? outcome.message : `${outcome.type}: unable to submit a result`,
 			};
 		}
 		const submission = submissionChannel.getSubmission();
@@ -140,6 +166,7 @@ export async function runPiChildAgent(options: RunPiChildAgentOptions): Promise<
 			errorMessage,
 		};
 	} finally {
+		unsubscribeRequest();
 		options.signal.removeEventListener("abort", onAbort);
 		await session.dispose();
 	}

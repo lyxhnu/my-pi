@@ -23,6 +23,20 @@ describe("jaccardSimilarity", () => {
 		// {a b c} vs {b c d}: intersection 2, union 4.
 		expect(jaccardSimilarity("a b c", "b c d")).toBeCloseTo(0.5);
 	});
+
+	it("segments continuous Chinese text", () => {
+		// {用户 喜欢 深色 主题 并 使用 中文 界面} vs {用户 偏好 深色 主题 使用 中文 界面}.
+		expect(jaccardSimilarity("用户喜欢深色主题并使用中文界面", "用户偏好深色主题，使用中文界面")).toBeCloseTo(2 / 3);
+	});
+
+	it("segments English independently of punctuation", () => {
+		expect(jaccardSimilarity("Alpha, beta! Gamma?", "alpha beta gamma")).toBe(1);
+	});
+
+	it("segments mixed Chinese and English text", () => {
+		// {使用 typescript 编写 代码} vs {使用 typescript 测试 代码}: intersection 3, union 5.
+		expect(jaccardSimilarity("使用 TypeScript 编写代码", "使用 TypeScript 测试代码")).toBeCloseTo(0.6);
+	});
 });
 
 describe("mmrRerank", () => {

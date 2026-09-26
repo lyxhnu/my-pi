@@ -82,8 +82,7 @@ export function contextReadFragments(
 	const window = currentContextWindow(branch);
 	const boundary = branch.findIndex(
 		(entry) =>
-			(entry.type === "context_window" || entry.type === "context_rollover" || entry.type === "compaction") &&
-			entry.windowId === window?.windowId,
+			(entry.type === "context_window" || entry.type === "context_rollover") && entry.windowId === window?.windowId,
 	);
 	const visibleResults = new Set(
 		manager
@@ -170,8 +169,7 @@ export class History {
 			this.authoritativeToolCalls.clear();
 		}
 		for (const entry of branch.slice(this.path.length)) {
-			if (entry.type === "context_window" || entry.type === "context_rollover" || entry.type === "compaction")
-				this.windowId = entry.windowId;
+			if (entry.type === "context_window" || entry.type === "context_rollover") this.windowId = entry.windowId;
 			if (entry.type === "pending_delivery") this.pending.set(entry.deliveryId, entry);
 			const deliveries =
 				entry.type === "delivery_receipt"
@@ -339,7 +337,7 @@ export class History {
 			>();
 			for (const entry of branch.slice(0, cutoff + 1)) {
 				if (
-					(entry.type === "context_window" || entry.type === "context_rollover" || entry.type === "compaction") &&
+					(entry.type === "context_window" || entry.type === "context_rollover") &&
 					(input.windowId === undefined || input.windowId === entry.windowId)
 				)
 					windows.set(entry.windowId, {

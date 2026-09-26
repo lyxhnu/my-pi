@@ -79,23 +79,38 @@ describe("manual compaction and Memory flush", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	it('manual flush (spec 10.5 Phase 1: "手动 /memory flush"): flushMemoryNow() summarizes the whole branch and writes to project memory without dropping any messages or appending a compaction entry', async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+	it("manual flush seals the closed evidence run without compacting the session", async () => {
+		const harness = await createHarness({
+			settings: { memory: { enabled: true } },
+			memoryArchiveExtractor: {
+				extract: async (sources) => ({
+					checkedSourceIds: sources.map((source) => source.sourceId),
+					uncheckedSourceIds: [],
+					candidates: [
+						{
+							candidateKey: "manual-flush-rule",
+							kind: "user_rule",
+							subject: "manual flush",
+							text: "Keep the durable project convention.",
+							scope: { project: true },
+							sourceIds: [sources.find((source) => source.origin === "user")!.sourceId],
+						},
+					],
+				}),
+			},
+		});
 		harnesses.push(harness);
-		seedCompactableSession(harness);
-		useSummaryStreamFn(harness, "manually flushed summary");
+		harness.setResponses([fauxAssistantMessage("recorded")]);
+		await harness.session.prompt("Keep the durable project convention.");
 		const messagesBefore = harness.session.agent.state.messages.length;
 
-		const result = await harness.session.flushMemoryNow("remember what matters");
+		const result = await harness.session.flushMemoryNow();
 
 		expect(result.attempted).toBe(true);
 		expect(result.written).toBe(1);
-		// Unlike compact(), a manual flush must not touch the live session at all.
 		expect(harness.session.agent.state.messages.length).toBe(messagesBefore);
 		expect(harness.sessionManager.getEntries().some((e) => e.type === "compaction")).toBe(false);
-
-		const hits = await harness.session.memoryStore.search("manually flushed summary", "project", harness.tempDir, 10);
-		expect(hits.length).toBeGreaterThan(0);
+		expect(harness.session.memoryAuthority.search("durable project", { cwd: harness.tempDir })).toHaveLength(1);
 	});
 
 	it("manual flush reports attempted:false (rather than throwing) when there is nothing new to summarize", async () => {
@@ -118,13 +133,13 @@ describe("manual compaction and Memory flush", () => {
 		expect(existsSync(harness.session.memoryStore.rootDir)).toBe(false);
 	});
 
-	it("manual compaction archives a session note without automatic Memory extraction", async () => {
+	it("manual compaction does not create or consolidate legacy session notes", async () => {
 		const harness = await createHarness({
 			withConfiguredAuth: false,
 			settings: { memory: { enabled: true } },
 		});
 		harnesses.push(harness);
-		// Existing session notes stay available without triggering extraction during manual compaction.
+		// Existing legacy session notes stay untouched.
 		harness.session.memoryStore.writeSessionNote(
 			harness.tempDir,
 			"earlier-a",
@@ -147,7 +162,7 @@ describe("manual compaction and Memory flush", () => {
 
 		const sessionsDir = join(harness.session.memoryStore.rootDir, workspaceHash(harness.tempDir), "sessions");
 		const noteFiles = readdirSync(sessionsDir).filter((f) => f.endsWith(".md"));
-		expect(noteFiles.length).toBe(3); // the 2 pre-seeded notes + this compaction's own note
+		expect(noteFiles.length).toBe(2);
 
 		const consolidated = await harness.session.memoryStore.search(
 			"Consolidated memory",

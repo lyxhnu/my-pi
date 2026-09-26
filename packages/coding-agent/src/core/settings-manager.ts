@@ -6,6 +6,11 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import {
+	type ExecutionUpgradeConfig,
+	type ExecutionUpgradeSettings,
+	resolveExecutionUpgradeSettings,
+} from "./execution-upgrade.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import type { MemoryEmbeddingSettings } from "./memory/embeddings.ts";
 import type { PermissionMode, PermissionRule } from "./permissions/types.ts";
@@ -76,6 +81,31 @@ export interface MemorySettings {
 	scopeDefault?: "global" | "project" | "all"; // default: "project"
 	globalAutoWrite?: boolean; // default: false (global memory writes require human confirmation)
 	embedding?: MemoryEmbeddingSettings; // default: unset (memory_search stays keyword-only)
+	archive?: MemoryArchiveSettings;
+}
+
+export interface MemoryArchiveSettings {
+	enabled?: boolean; // default: false
+	maxConcurrencyPerProject?: number; // default: 1
+	maxFailuresPerWorkItem?: number; // default: 3
+	modelCallTimeoutMs?: number; // default: 60000
+	maxInputTokensPerCall?: number; // default: 16000
+	maxOutputTokensPerCall?: number; // default: 2000
+	maxModelCallsPerSlice?: number; // default: 4
+	maxCandidatesPerBatch?: number; // default: 12
+	maxModelCallsPerProjectHour?: number; // default: 24
+}
+
+export interface ResolvedMemoryArchiveSettings {
+	enabled: boolean;
+	maxConcurrencyPerProject: number;
+	maxFailuresPerWorkItem: number;
+	modelCallTimeoutMs: number;
+	maxInputTokensPerCall: number;
+	maxOutputTokensPerCall: number;
+	maxModelCallsPerSlice: number;
+	maxCandidatesPerBatch: number;
+	maxModelCallsPerProjectHour: number;
 }
 
 export interface BranchSummarySettings {
@@ -149,6 +179,7 @@ export interface Settings {
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
+	executionUpgrade?: ExecutionUpgradeSettings;
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -889,6 +920,10 @@ export class SettingsManager {
 		return resolveReminderPolicy(this.settings.reminder);
 	}
 
+	getExecutionUpgradeSettings(): ExecutionUpgradeConfig {
+		return resolveExecutionUpgradeSettings(this.settings.executionUpgrade);
+	}
+
 	/** Timeout for exit_plan_mode's PendingInteraction. No connected driver (TUI/RPC) resolving it in time fails closed. */
 	getPlanModeApprovalTimeoutMs(): number {
 		return this.settings.planMode?.approvalTimeoutMs ?? 120_000;
@@ -900,12 +935,34 @@ export class SettingsManager {
 		scopeDefault: "global" | "project" | "all";
 		globalAutoWrite: boolean;
 		embedding: MemoryEmbeddingSettings | undefined;
+		archive: ResolvedMemoryArchiveSettings;
 	} {
+		const archive = this.settings.memory?.archive;
+		const positiveInteger = (value: number | undefined, fallback: number, name: string): number => {
+			const resolved = value ?? fallback;
+			if (!Number.isSafeInteger(resolved) || resolved <= 0) throw new Error(`Invalid memory.archive.${name}`);
+			return resolved;
+		};
 		return {
 			enabled: this.settings.memory?.enabled ?? false,
 			scopeDefault: this.settings.memory?.scopeDefault ?? "project",
 			globalAutoWrite: this.settings.memory?.globalAutoWrite ?? false,
 			embedding: this.settings.memory?.embedding,
+			archive: {
+				enabled: archive?.enabled ?? false,
+				maxConcurrencyPerProject: positiveInteger(archive?.maxConcurrencyPerProject, 1, "maxConcurrencyPerProject"),
+				maxFailuresPerWorkItem: positiveInteger(archive?.maxFailuresPerWorkItem, 3, "maxFailuresPerWorkItem"),
+				modelCallTimeoutMs: positiveInteger(archive?.modelCallTimeoutMs, 60_000, "modelCallTimeoutMs"),
+				maxInputTokensPerCall: positiveInteger(archive?.maxInputTokensPerCall, 16_000, "maxInputTokensPerCall"),
+				maxOutputTokensPerCall: positiveInteger(archive?.maxOutputTokensPerCall, 2_000, "maxOutputTokensPerCall"),
+				maxModelCallsPerSlice: positiveInteger(archive?.maxModelCallsPerSlice, 4, "maxModelCallsPerSlice"),
+				maxCandidatesPerBatch: positiveInteger(archive?.maxCandidatesPerBatch, 12, "maxCandidatesPerBatch"),
+				maxModelCallsPerProjectHour: positiveInteger(
+					archive?.maxModelCallsPerProjectHour,
+					24,
+					"maxModelCallsPerProjectHour",
+				),
+			},
 		};
 	}
 

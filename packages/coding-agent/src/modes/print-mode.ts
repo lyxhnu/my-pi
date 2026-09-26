@@ -130,9 +130,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			session.state.runState.status === "idle" &&
 			session.state.runState.lastOutcome?.type === "context_transition"
 		) {
+			const gate = session.getContextTransitionGate();
+			if (gate.status !== "busy") {
+				await session.waitForIdle();
+				break;
+			}
 			const activeTaskIds = session.taskManager
 				.list()
-				.filter((task) => task.status === "running" || task.status === "cancelling")
+				.filter((task) => task.kind !== "subagent" && (task.status === "running" || task.status === "cancelling"))
 				.map((task) => task.taskId);
 			if (activeTaskIds.length === 0) break;
 			await Promise.all(activeTaskIds.map((taskId) => session.taskManager.awaitSettled(taskId)));
@@ -152,11 +157,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		if (
 			session.state.runState.status === "idle" &&
-			(session.state.runState.lastOutcome?.type === "context_limit" ||
-				session.state.runState.lastOutcome?.type === "context_transition")
+			session.state.runState.lastOutcome &&
+			session.state.runState.lastOutcome.type !== "completed"
 		) {
+			const outcome = session.state.runState.lastOutcome;
 			console.error(
-				`${session.state.runState.lastOutcome.type}: task not completed; inspect the context/rollover trace for the blocking reason.`,
+				`${outcome.type}: ${"message" in outcome && outcome.message ? outcome.message : "task not completed; inspect the context/rollover trace for the blocking reason."}`,
 			);
 			return 1;
 		}

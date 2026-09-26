@@ -115,6 +115,7 @@ function createMutableAgentState(initialState?: Partial<Omit<AgentState, "runSta
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
+	prepareRequest?: AgentLoopConfig["prepareRequest"];
 	controlRequest?: AgentLoopConfig["controlRequest"];
 	afterTurnControl?: AgentLoopConfig["afterTurnControl"];
 	getContextBudgetOptions?: AgentLoopConfig["getContextBudgetOptions"];
@@ -246,6 +247,7 @@ type PreparedContinuationRecord = {
  * and exposes queueing APIs for steering and follow-up messages.
  */
 export class Agent {
+	public prepareRequest?: AgentLoopConfig["prepareRequest"];
 	public controlRequest?: AgentLoopConfig["controlRequest"];
 	public afterTurnControl?: AgentLoopConfig["afterTurnControl"];
 	public getContextBudgetOptions?: AgentLoopConfig["getContextBudgetOptions"];
@@ -308,6 +310,7 @@ export class Agent {
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
 		const runtimeOptions: Partial<AgentOptions> = options ?? {};
+		this.prepareRequest = runtimeOptions.prepareRequest;
 		this.controlRequest = runtimeOptions.controlRequest;
 		this.afterTurnControl = runtimeOptions.afterTurnControl;
 		this._state = createMutableAgentState(runtimeOptions.initialState);
@@ -476,13 +479,42 @@ export class Agent {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
 		if (this._state.messages.length === 0) throw new Error("No messages to continue from");
+		if (this.preparedContinuation || this.preparationInFlight) {
+			throw new Error("Settle the prepared continuation before starting an ordinary continuation.");
+		}
 		const lastMessage = this._state.messages.at(-1);
 		if (lastMessage?.role === "assistant" && !this.hasQueuedMessages()) {
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
-		const preparation = await this.prepareContinuation(this._state.messages, options);
-		await this.dispatchPreparedContinuation(preparation);
+		await this.runWithLifecycle(async (signal) => {
+			const onAbort = () => this.abort();
+			options.signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				options.signal?.throwIfAborted();
+				const context = this.createContextSnapshot();
+				if (options.toolNames)
+					context.tools = context.tools?.filter((tool) => options.toolNames!.includes(tool.name));
+				const items = this.selectQueueItems(context.messages, options.requiredQueueItemIds);
+				const reservationId = `continuation-${this.nextPreparationId++}`;
+				this.reserveQueueItems(
+					items.map((item) => item.queueItemId),
+					reservationId,
+				);
+				this.consumeQueueReservation(reservationId);
+				await runAgentLoopPrepared(
+					context,
+					items,
+					undefined,
+					this.createLoopConfig({ skipInitialSteeringPoll: true, maxTokens: options.maxTokens }),
+					(event) => this.processEvents(event),
+					signal,
+					this.streamFunction,
+				);
+			} finally {
+				options.signal?.removeEventListener("abort", onAbort);
+			}
+		});
 	}
 
 	/** Prepare and freeze the first provider request for a future continuation. */
@@ -631,8 +663,11 @@ export class Agent {
 					? this._state.tools.slice()
 					: this._state.tools.filter((tool) => options.toolNames!.includes(tool.name)),
 		};
-		return (await prepareAgentRequest(context, this.createLoopConfig({ maxTokens: options.maxTokens }), undefined))
-			.budget;
+		return (
+			await prepareAgentRequest(context, this.createLoopConfig({ maxTokens: options.maxTokens }), undefined, {
+				mode: "measure",
+			})
+		).budget;
 	}
 
 	/** Release a prepared continuation without mutating transcript or append-only state. */
@@ -754,6 +789,7 @@ export class Agent {
 		this.appendOnlyContext?.noteModel(this._state.model.provider, this._state.model.id);
 		return {
 			model: this._state.model,
+			prepareRequest: this.prepareRequest,
 			maxTokens: options.maxTokens,
 			controlRequest: this.controlRequest,
 			afterTurnControl: this.afterTurnControl,

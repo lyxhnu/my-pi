@@ -139,12 +139,14 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 
 			// Should have: summary + kept (3,4) + after (6,7) = 5 messages
-			expect(ctx.messages).toHaveLength(6);
-			expect((ctx.messages[1] as any).summary).toContain("Summary of first two turns");
-			expect((ctx.messages[2] as any).content).toBe("second");
-			expect((ctx.messages[3] as any).content[0].text).toBe("response2");
-			expect((ctx.messages[4] as any).content).toBe("third");
-			expect((ctx.messages[5] as any).content[0].text).toBe("response3");
+			expect(ctx.messages).toHaveLength(5);
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Summary of first two turns" });
+			expect(ctx.messages.slice(1)).toEqual(
+				entries
+					.filter((entry) => entry.type === "message")
+					.slice(2)
+					.map((entry) => entry.message),
+			);
 		});
 
 		it("handles compaction keeping from first message", () => {
@@ -157,8 +159,8 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 
 			// Summary + all messages (1,2,4)
-			expect(ctx.messages).toHaveLength(5);
-			expect((ctx.messages[1] as any).summary).toContain("Empty summary");
+			expect(ctx.messages).toHaveLength(4);
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Empty summary" });
 		});
 
 		it("multiple compactions uses latest", () => {
@@ -174,8 +176,8 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 
 			// Should use second summary, keep from 4
-			expect(ctx.messages).toHaveLength(5);
-			expect((ctx.messages[1] as any).summary).toContain("Second summary");
+			expect(ctx.messages).toHaveLength(4);
+			expect(ctx.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Second summary" });
 		});
 
 		it("buildContextEntries returns compaction-aware entries including custom entries", () => {
@@ -192,12 +194,7 @@ describe("buildSessionContext", () => {
 
 			expect(buildContextEntries(entries).map((entry) => entry.id)).toEqual(["6", "4", "5", "7", "8"]);
 			const ctx = buildSessionContext(entries);
-			expect(ctx.messages.map((message) => message.role)).toEqual([
-				"custom",
-				"compactionSummary",
-				"user",
-				"assistant",
-			]);
+			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user", "assistant"]);
 		});
 
 		it("keeps settings from the full path after compaction", () => {
@@ -211,7 +208,7 @@ describe("buildSessionContext", () => {
 
 			const ctx = buildSessionContext(entries);
 			expect(ctx.thinkingLevel).toBe("high");
-			expect(ctx.messages.map((message) => message.role)).toEqual(["custom", "compactionSummary", "user"]);
+			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user"]);
 		});
 	});
 
@@ -274,12 +271,14 @@ describe("buildSessionContext", () => {
 
 			// Main path to 7: summary + kept(3,4) + after(6,7)
 			const ctxMain = buildSessionContext(entries, "7");
-			expect(ctxMain.messages).toHaveLength(6);
-			expect((ctxMain.messages[1] as any).summary).toContain("Compacted history");
-			expect((ctxMain.messages[2] as any).content).toBe("q2");
-			expect((ctxMain.messages[3] as any).content[0].text).toBe("r2");
-			expect((ctxMain.messages[4] as any).content).toBe("q3");
-			expect((ctxMain.messages[5] as any).content[0].text).toBe("r3");
+			expect(ctxMain.messages).toHaveLength(5);
+			expect(ctxMain.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Compacted history" });
+			expect(ctxMain.messages.slice(1)).toEqual(
+				[entries[2], entries[3], entries[5], entries[6]].map((entry) => {
+					if (entry.type !== "message") throw new Error("Expected message fixture");
+					return entry.message;
+				}),
+			);
 
 			// Branch path to 11: 1,2,3 + branch_summary + 11
 			const ctxBranch = buildSessionContext(entries, "11");

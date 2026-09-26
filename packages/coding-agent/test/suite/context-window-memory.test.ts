@@ -38,6 +38,36 @@ describe("context window memory", () => {
 	const longTask = `Never publish. Review the implementation.\n${"Saved original task context. ".repeat(1400)}`;
 	const shortTask = "Never publish. Review the implementation and report the next concrete verification step.";
 
+	it("accepts the documented minimal first context note", async () => {
+		const h = await setup();
+		h.setResponses([fauxAssistantMessage("ready")]);
+		await h.session.prompt("Preserve the deployment constraint.");
+		const source = new History(h.sessionManager).getItems().find((item) => item.role === "user");
+		if (!source) throw new Error("missing task source");
+		const tool = createContextNoteToolDefinition({
+			sessionManager: h.sessionManager,
+			getPromptGeneration: () => h.sessionManager.getLatestContextCoordinates().promptGeneration,
+			getContextEpoch: () => h.sessionManager.getLatestContextCoordinates().contextEpoch,
+		});
+		const result = await tool.execute(
+			"note-call",
+			{
+				operation: "upsert",
+				kind: "constraint",
+				key: "deployment",
+				text: "Preserve the deployment constraint.",
+				sourceRefs: [{ entryId: source.entryId, blockIndex: 0 }],
+			},
+			undefined,
+			undefined,
+			h.session.extensionRunner.createContext(),
+		);
+
+		expect(result.details).toMatchObject({ operation: "upsert", kind: "constraint", key: "deployment" });
+		expect(tool.promptGuidelines?.join("\n")).toContain("evidenceRefs and resume are optional");
+		expect(tool.promptGuidelines?.join("\n")).toContain("Never send an empty supersedesEventId");
+	});
+
 	function saveContinuation(
 		h: Harness,
 		text = "Read the saved requirements, then review the implementation.",
@@ -49,12 +79,13 @@ describe("context window memory", () => {
 				"get_context_remaining",
 				"history",
 				"new_context",
+				...(h.session.getActiveToolNames().includes("todo_write") ? ["todo_write"] : []),
 			]);
 			const saveStateMessage = h.session.messages.find(
 				(message) => message.role === "custom" && message.customType === "context-save-state",
 			);
 			if (saveStateMessage?.role !== "custom") throw new Error("missing save-state control message");
-			expect(saveStateMessage.content).toContain("no resumeRef exists yet");
+			expect(saveStateMessage.content).toContain("No resumeRef exists yet");
 			expect(saveStateMessage.content).toContain('{"operation":"list_items","role":"user"}');
 			expect(saveStateMessage.content).toContain("list_windows is insufficient");
 			expect(saveStateMessage.content).toContain('{"operation":"query"} and no resumeRef');
@@ -88,6 +119,7 @@ describe("context window memory", () => {
 					requiredHistoryRefs: [],
 					requirementSourceRefs: [reference],
 					todoIds: [],
+					subagentContinuations: [],
 				},
 			});
 			return fauxAssistantMessage([...(withBudget ? [fauxToolCall("get_context_remaining", {})] : []), note], {
@@ -148,7 +180,19 @@ describe("context window memory", () => {
 					];
 				});
 				return fauxAssistantMessage(
-					[fauxToolCall("context_note", { operation: "query", item: nextAction.eventId }), ...reads],
+					[
+						fauxToolCall("context_note", { operation: "query", item: nextAction.eventId }),
+						...reads,
+						...records
+							.filter((item) => item.type === "todo")
+							.map((item) =>
+								fauxToolCall("history", {
+									operation: "read_item",
+									entryId: item.entryId,
+									todoId: item.todoId,
+								}),
+							),
+					],
 					{ stopReason: "toolUse" },
 				);
 			},
@@ -222,6 +266,7 @@ describe("context window memory", () => {
 								requiredHistoryRefs: [],
 								requirementSourceRefs: [source],
 								todoIds: [],
+								subagentContinuations: [],
 							},
 						}),
 						fauxToolCall("mutate", {}),
@@ -261,6 +306,7 @@ describe("context window memory", () => {
 							requiredHistoryRefs: [result],
 							requirementSourceRefs: [requirement],
 							todoIds: [],
+							subagentContinuations: [],
 						},
 					}),
 					{ stopReason: "toolUse" },
@@ -606,6 +652,7 @@ describe("context window memory", () => {
 							requiredHistoryRefs: [],
 							requirementSourceRefs: [reference],
 							todoIds: [],
+							subagentContinuations: [],
 						},
 					}),
 					{ stopReason: "toolUse" },
@@ -694,21 +741,19 @@ describe("context window memory", () => {
 		expect(h.sessionManager.getLatestContextCoordinates().promptGeneration).toBe(1);
 	});
 
-	it("uses the same commit path for an explicit provider context rejection", async () => {
+	it("asks the model after provider rejection and never infers a window request", async () => {
 		const h = await setup();
 		h.setResponses([
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "maximum context length exceeded" }),
-			saveContinuation(h),
-			...recoveryResponses("continued"),
+			fauxAssistantMessage("The current window cannot continue; no new window requested."),
 		]);
 		await h.session.prompt(shortTask);
-		expect(h.sessionManager.getBranch().find((entry) => entry.type === "context_rollover")).toMatchObject({
-			cause: "provider_context_rejected",
-		});
-		expect(h.faux.state.callCount).toBe(6);
+		expect(h.sessionManager.getBranch().some((entry) => entry.type === "context_rollover")).toBe(false);
+		expect(h.eventsOfType("compaction_start")).toHaveLength(1);
+		expect(h.faux.state.callCount).toBe(2);
 	});
 
-	it("starts state saving before a provider call when the final request reaches the work threshold", async () => {
+	it("re-measures pressure from the final transform before deciding whether further maintenance is needed", async () => {
 		let inflateNextNormalRequest = true;
 		const h = await setup({
 			models: [{ id: "automatic-threshold", contextWindow: 24000, maxTokens: 1000 }],
@@ -733,12 +778,11 @@ describe("context window memory", () => {
 				},
 			],
 		});
-		h.setResponses([saveContinuation(h), ...recoveryResponses("continued after the automatic rollover")]);
+		h.setResponses([fauxAssistantMessage("The transient context is gone; complete in the original window.")]);
 		await h.session.prompt(shortTask);
-		expect(h.faux.state.callCount).toBe(5);
-		expect(h.sessionManager.getBranch().find((entry) => entry.type === "context_rollover")).toMatchObject({
-			cause: "work_budget_reached",
-		});
+		expect(h.faux.state.callCount).toBe(1);
+		expect(h.sessionManager.getBranch().some((entry) => entry.type === "context_rollover")).toBe(false);
+		expect(h.eventsOfType("compaction_start")).toHaveLength(0);
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "completed" } });
 	});
 
@@ -812,6 +856,7 @@ describe("context window memory", () => {
 							requiredHistoryRefs: [],
 							requirementSourceRefs: [reference],
 							todoIds: [],
+							subagentContinuations: [],
 						},
 					}),
 					{ stopReason: "toolUse" },
@@ -1350,6 +1395,7 @@ describe("context window memory", () => {
 				requiredHistoryRefs: [],
 				requirementSourceRefs: [{ entryId: taskId }],
 				todoIds: ["todo-1"],
+				subagentContinuations: [],
 			},
 		};
 		const noteCall = fauxToolCall("context_note", noteInput);
@@ -1382,6 +1428,9 @@ describe("context window memory", () => {
 		if (!todoItem?.todoRevision) throw new Error("missing Todo revision");
 		const notePage = queryTaskNotes(manager, 1, { operation: "query", item: nextActionEventId });
 		const recovery: ContextRecoveryReferences = {
+			subagentTasks: [],
+			requiredTaskIds: [],
+			subagentNoteEventId: null,
 			saveStateOperationId: "save",
 			nextActionEventId,
 			relatedNoteEventIds: [],
@@ -1561,12 +1610,16 @@ describe("context window memory", () => {
 				requiredHistoryRefs: [],
 				requirementSourceRefs: [{ entryId: taskId }],
 				todoIds: [],
+				subagentContinuations: [],
 			},
 		});
 		const originalProjection = queryTaskNotes(manager, 1, { operation: "query" });
 		const cutoffId = manager.getLeafId();
 		if (!cutoffId) throw new Error("missing recovery cutoff");
 		const committed: ContextRecoveryReferences = {
+			subagentTasks: [],
+			requiredTaskIds: [],
+			subagentNoteEventId: null,
 			saveStateOperationId: "save",
 			nextActionEventId: originalNextAction,
 			relatedNoteEventIds: [originalConstraint],
@@ -1615,6 +1668,7 @@ describe("context window memory", () => {
 				requiredHistoryRefs: [{ entryId: taskId }],
 				requirementSourceRefs: [{ entryId: taskId }],
 				todoIds: [],
+				subagentContinuations: [],
 			},
 			supersedesEventId: originalNextAction,
 		});

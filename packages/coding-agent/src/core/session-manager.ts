@@ -29,6 +29,7 @@ import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import type {
+	ContextControlCause,
 	ContextRecoveryReferences,
 	ContextRolloverBlockedReason,
 	ContextRolloverRevisions,
@@ -40,6 +41,7 @@ import {
 	currentContextWindow,
 	formatContextWindow,
 } from "./context-window.ts";
+import type { ExecutionUpgradeOutcome } from "./execution-upgrade.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -111,7 +113,7 @@ export interface ContextOperationEntry extends SessionEntryBase {
 	type: "context_operation";
 	operationId: string;
 	operationKind: "save_state";
-	transitionCause: ContextTransitionCause;
+	transitionCause: ContextControlCause;
 	state: "started" | "finished";
 	windowId: string;
 	promptGeneration: number;
@@ -188,7 +190,7 @@ export interface ContextRolloverDispatchEntry extends SessionEntryBase {
 	state: "started" | "finished" | "blocked" | "cancelled";
 	requestFingerprint: string;
 	reservedDeliveryIds?: string[];
-	outcome?: "completed" | "context_limit" | "context_transition" | "aborted" | "failed";
+	outcome?: "completed" | "context_limit" | "context_maintenance" | "context_transition" | "aborted" | "failed";
 	reason?: ContextRolloverBlockedReason;
 }
 
@@ -196,6 +198,21 @@ export interface ContextRolloverDispatchEntry extends SessionEntryBase {
 export interface SessionTraceEntry extends SessionEntryBase {
 	type: "trace";
 	event: SessionTraceEvent;
+}
+
+/** Raw archive evidence. It is persisted and branch-anchored, but never becomes a tree node or model message. */
+export interface MemoryEvidenceEntry extends SessionEntryBase {
+	type: "memory_evidence";
+	evidenceEventId: string;
+	rootPromptId: string;
+	origin: "user" | "runtime" | "extension" | "tool" | "subagent" | "assistant";
+	content: string;
+	visibility: "session" | "project_rule";
+	deliveryState?: "pending" | "delivered";
+	completeness?: "complete" | "partial";
+	sourceEntryId?: string;
+	toolCallId?: string;
+	taskId?: string;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -207,12 +224,17 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+	/** When present, model and reasoning are a single committed execution profile. */
+	thinkingLevel?: string;
+	executionUpgrade?: ExecutionUpgradeOutcome;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase, ContextWindowIdentity {
 	type: "compaction";
 	summary: string;
 	firstKeptEntryId: string;
+	/** Authoritative requirements retained verbatim outside the summarized prefix. */
+	preservedEntryIds?: string[];
 	tokensBefore: number;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
@@ -315,6 +337,7 @@ export type SessionEntry =
 	| ContextTransitionRequestEntry
 	| ContextRolloverDispatchEntry
 	| SessionTraceEntry
+	| MemoryEvidenceEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
 	| CompactionEntry
@@ -522,6 +545,10 @@ function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntr
 	return index;
 }
 
+function isLogOnlyEntry(entry: SessionEntry): entry is SessionTraceEntry | MemoryEvidenceEntry {
+	return entry.type === "trace" || entry.type === "memory_evidence";
+}
+
 function buildSessionPath(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -537,7 +564,7 @@ function buildSessionPath(
 	}
 	if (!leaf) {
 		for (let i = entries.length - 1; i >= 0; i--) {
-			if (entries[i].type !== "trace") {
+			if (!isLogOnlyEntry(entries[i])) {
 				leaf = entries[i];
 				break;
 			}
@@ -566,6 +593,7 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
 			thinkingLevel = entry.thinkingLevel;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
+			if (entry.thinkingLevel !== undefined) thinkingLevel = entry.thinkingLevel;
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
 			model = { provider: entry.message.provider, modelId: entry.message.model };
 		}
@@ -675,13 +703,14 @@ export function buildContextEntries(
 
 	if (compaction.type === "context_rollover") return applyRedactions(path.slice(compactionIdx), redactions);
 	const contextEntries: SessionEntry[] = [compaction];
+	const preserved = new Set(compaction.preservedEntryIds);
 	let foundFirstKept = false;
 	for (let i = 0; i < compactionIdx; i++) {
 		const entry = path[i];
 		if (entry.id === compaction.firstKeptEntryId) {
 			foundFirstKept = true;
 		}
-		if (foundFirstKept) {
+		if (foundFirstKept || preserved.has(entry.id)) {
 			contextEntries.push(entry);
 		}
 	}
@@ -1249,7 +1278,7 @@ export class SessionManager {
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
-			if (entry.type !== "trace") {
+			if (!isLogOnlyEntry(entry)) {
 				this.leafId = entry.id;
 			}
 			if (entry.type === "label") {
@@ -1317,6 +1346,7 @@ export class SessionManager {
 				e.type === "context_rollover" ||
 				e.type === "context_rollover_dispatch" ||
 				e.type === "compaction" ||
+				e.type === "memory_evidence" ||
 				(e.type === "custom" && e.customType === "task-note-event") ||
 				(e.type === "trace" &&
 					e.event.type === "context/budget" &&
@@ -1387,6 +1417,27 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			event,
+		};
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			throw error;
+		}
+		return entry.id;
+	}
+
+	/** Persist raw archive evidence without advancing the logical conversation tree. */
+	appendMemoryEvidence(evidence: Omit<MemoryEvidenceEntry, "type" | "id" | "parentId" | "timestamp">): string {
+		const entry: MemoryEvidenceEntry = {
+			type: "memory_evidence",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...evidence,
 		};
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
@@ -1674,7 +1725,7 @@ export class SessionManager {
 	}
 
 	/** Append a model change as child of current leaf, then advance leaf. Returns entry id. */
-	appendModelChange(provider: string, modelId: string): string {
+	appendModelChange(provider: string, modelId: string, executionUpgrade?: ExecutionUpgradeOutcome): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(this.byId),
@@ -1682,6 +1733,9 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
+			...(executionUpgrade === undefined
+				? {}
+				: { thinkingLevel: executionUpgrade.requested.thinkingLevel, executionUpgrade }),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1695,15 +1749,17 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		usage?: Usage,
+		preservedEntryIds?: string[],
 	): string {
 		const entry: CompactionEntry<T> = {
-			...createContextWindowIdentity(this.getBranch()),
+			...this.ensureContextWindow(),
 			type: "compaction",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			summary,
 			firstKeptEntryId,
+			preservedEntryIds,
 			tokensBefore,
 			details,
 			usage,
@@ -1825,7 +1881,7 @@ export class SessionManager {
 	getChildren(parentId: string): SessionEntry[] {
 		const children: SessionEntry[] = [];
 		for (const entry of this.byId.values()) {
-			if (entry.type !== "trace" && entry.parentId === parentId) {
+			if (!isLogOnlyEntry(entry) && entry.parentId === parentId) {
 				children.push(entry);
 			}
 		}
@@ -1905,9 +1961,13 @@ export class SessionManager {
 		return this.getEntries().filter(
 			(entry) =>
 				branchIds.has(entry.id) ||
+				(entry.type === "memory_evidence" && (entry.parentId === null || branchIds.has(entry.parentId))) ||
 				(entry.type === "trace" &&
 					(traceTurns.has(entry.event.data.turn) ||
-						(entry.event.type === "memory/archive" && branchIds.has(entry.event.data.compactionId)) ||
+						(entry.event.type === "memory/archive" &&
+							((entry.event.data.compactionId !== undefined && branchIds.has(entry.event.data.compactionId)) ||
+								(entry.event.data.sourceEntryId !== undefined &&
+									branchIds.has(entry.event.data.sourceEntryId)))) ||
 						(entry.event.type === "compaction/summary" && branchIds.has(entry.event.data.firstKeptEntryId)))),
 		);
 	}
@@ -1951,7 +2011,7 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries().filter((entry) => entry.type !== "trace");
+		const entries = this.getEntries().filter((entry) => !isLogOnlyEntry(entry));
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
@@ -2002,7 +2062,7 @@ export class SessionManager {
 	 */
 	branch(branchFromId: string): void {
 		const entry = this.byId.get(branchFromId);
-		if (!entry || entry.type === "trace") {
+		if (!entry || isLogOnlyEntry(entry)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
@@ -2030,8 +2090,9 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
-		if (branchFromId !== null && this.byId.get(branchFromId)?.type === "trace") {
-			throw new Error(`Entry ${branchFromId} not found`);
+		if (branchFromId !== null) {
+			const branchEntry = this.byId.get(branchFromId);
+			if (branchEntry && isLogOnlyEntry(branchEntry)) throw new Error(`Entry ${branchFromId} not found`);
 		}
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
@@ -2072,7 +2133,7 @@ export class SessionManager {
 		let pathParentId: string | null = null;
 		for (const entry of this.getBranchWithTrace(leafId)) {
 			if (entry.type === "label") continue;
-			if (entry.type === "trace") {
+			if (isLogOnlyEntry(entry)) {
 				pathWithoutLabels.push({
 					...entry,
 					parentId: entry.parentId !== null && logicalPathIds.has(entry.parentId) ? entry.parentId : pathParentId,

@@ -30,7 +30,7 @@ export function createNewContextToolDefinition(manager: SessionManager): ToolDef
 		name: "new_context",
 		label: "new_context",
 		description:
-			"Request a fresh context window to continue this task. Save important semantic changes with context_note first. The complete current tool batch finishes before the runtime switches windows.",
+			"Call this when the task is unfinished and the current context cannot support the next useful step, including when Shake and Compaction leave insufficient working capacity. Save important semantic changes with context_note first. The complete current tool batch finishes before the runtime switches windows.",
 		parameters: newContextSchema,
 		async execute(toolCallId, input) {
 			const requestId = manager.requestContextTransition(toolCallId, input.reason);

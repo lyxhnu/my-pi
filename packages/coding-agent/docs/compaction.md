@@ -1,9 +1,9 @@
 # Compaction & Branch Summarization
 
-LLMs have limited context windows. Automatic capacity management uses fresh context windows and bounded retrieval; see [memory and context](memory-context.md). This page describes explicit `/compact` and branch summarization.
+LLMs have limited context windows. Automatic capacity management uses Shake, then same-window Compaction, then a bounded model decision about opening a new window; see [memory and context](memory-context.md). This page describes shared compaction and branch summarization.
 
 **Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
-- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Manual compaction logic
+- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Shared compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
@@ -17,7 +17,7 @@ Pi has two summarization mechanisms:
 
 | Mechanism | Trigger | Purpose |
 |-----------|---------|---------|
-| Compaction | `/compact` | Summarize old messages to free up context |
+| Compaction | Capacity pressure after Shake, or `/compact` | Summarize old messages within the current window |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
 Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
@@ -26,15 +26,15 @@ Both use the same structured summary format and track file operations cumulative
 
 ### When It Triggers
 
-Trigger compaction explicitly with `/compact [instructions]`. Optional instructions focus the summary. Each committed compaction creates a new window identity and preserves the selected recent messages. Automatic window transitions do not invoke this summarizer.
+Compaction runs when automatic Shake does not resolve capacity pressure. It also runs explicitly with `/compact [instructions]`; optional instructions focus the summary. Both paths preserve the current window identity. Only the model's explicit `new_context` intent authorizes a hard window transition.
 
 ### How It Works
 
 1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
 3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
-4. **Validate and append entry**: Require complete, nonempty output and unchanged source/boundary; then save `CompactionEntry` with summary and `firstKeptEntryId`
-5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards
+4. **Validate and append entry**: Require complete, nonempty output and unchanged source/boundary. Automatic compaction also requires a strictly smaller final transformed request. Save `CompactionEntry` with summary, `firstKeptEntryId`, and source IDs of preserved user requirements
+5. **Reload**: Session uses summary + preserved requirements + messages from `firstKeptEntryId` onwards; the request includes current Notes and unfinished Todo
 
 ```
 Before compaction:
@@ -101,7 +101,7 @@ For split turns, pi summarizes each nonempty region and merges the results:
 
 The previous summary is retained even when there are no new complete history turns. With no new content, no model request or new boundary is committed (`/compact` reports "Already compacted"). Empty, length-truncated, failed or cancelled summaries cannot replace the current context. Extension-provided summaries must pass the same nonempty and source-boundary checks.
 
-Compaction commits before writing an optional Memory session note. Note-write failures do not roll back compaction. `history` can read saved visible ancestors after compaction without rerunning tools.
+Compaction does not write Notes or promote long-term Memory. Note and Todo keep their own authority. `history` can read saved visible ancestors after compaction without rerunning tools.
 
 ### Cut Point Rules
 
@@ -124,9 +124,10 @@ interface CompactionEntry<T = unknown> {
   previousWindowId: string | null;
   id: string;
   parentId: string;
-  timestamp: number;
+  timestamp: string;
   summary: string;
   firstKeptEntryId: string;
+  preservedEntryIds?: string[]; // User requirements retained verbatim before the kept boundary
   tokensBefore: number;
   usage?: Usage;       // LLM usage that generated the summary
   fromHook?: boolean;  // true if provided by extension (legacy field name)
@@ -288,8 +289,8 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.settings - compaction settings
 
   // branchEntries - all entries on current branch (for custom state)
-  // reason - "manual" (/compact)
-  // willRetry - false for manual compaction
+  // reason - "manual" (/compact), "threshold", or "overflow"
+  // willRetry - false; the host remeasures after automatic compaction
   // signal - AbortSignal (pass to LLM calls)
 
   // Cancel:
@@ -393,9 +394,9 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Enable automatic context-window transitions |
-| `reserveTokens` | `16384` | Manual-summary output budget |
-| `keepRecentTokens` | `20000` | Recent tokens retained by manual compaction |
+| `enabled` | `true` | Enable automatic Shake, Compaction, and model window decisions |
+| `reserveTokens` | `16384` | Compaction-summary output budget |
+| `keepRecentTokens` | `20000` | Recent tokens retained by compaction |
 | `autoCompactThresholdPercent` | `85` | Work-budget ceiling before the state-saving reserve |
 
-Disable automatic capacity-triggered transitions with `"enabled": false`. You can still compact manually with `/compact`; request preflight remains enabled.
+Disable automatic capacity maintenance with `"enabled": false`. You can still compact manually with `/compact`; request preflight remains enabled.

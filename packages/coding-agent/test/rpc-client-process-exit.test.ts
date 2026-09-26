@@ -35,4 +35,17 @@ process.stdin.resume();
 
 		await expect(client.getCommands()).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
 	});
+
+	test("uses the configured command response timeout", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.stdin.resume();
+`),
+			requestTimeoutMs: 20,
+		});
+
+		await client.start();
+		await expect(client.getCommands()).rejects.toThrow("Timeout waiting for response to get_commands");
+		await client.stop();
+	});
 });

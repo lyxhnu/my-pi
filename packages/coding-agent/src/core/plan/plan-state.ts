@@ -44,6 +44,7 @@ export const PLAN_MODE_READ_ONLY_TOOLS = [
 	"get_context_remaining",
 	"new_context",
 	"context_note",
+	"upgrade_execution",
 ];
 
 export function buildPlanArtifact(input: {

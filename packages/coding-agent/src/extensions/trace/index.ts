@@ -48,6 +48,12 @@ function compactText(value: string, maxLength = 72): string {
 function traceSummary(entry: SessionTraceEntry): string {
 	const event = entry.event;
 	switch (event.type) {
+		case "execution/status":
+			return `execution/status ${event.data.metrics.rounds} rounds · ${event.data.metrics.toolCalls} tools${event.data.reminder ? " · review reminder" : ""}`;
+		case "execution/upgrade":
+			return `execution/upgrade ${event.data.outcome.status} · ${event.data.outcome.requested.targetModel} / ${event.data.outcome.requested.thinkingLevel}${event.data.taskId ? ` · task ${event.data.taskId}` : ""}`;
+		case "task/request":
+			return `task/request ${event.data.taskId} · ${event.data.header.provider}/${event.data.header.model} · thinking ${event.data.header.reasoning ?? "off"}`;
 		case "turn/start":
 			return `turn/start #${event.data.turn}`;
 		case "turn/end":
@@ -70,7 +76,7 @@ function traceSummary(entry: SessionTraceEntry): string {
 			return `step/end #${event.data.step} · ${event.data.stopReason ?? "unknown"}`;
 		case "request/header": {
 			const header = event.data.header;
-			return `request/header ${header.provider}/${header.model} · ${header.messages.length} messages · ${header.tools?.length ?? 0} tools`;
+			return `request/header ${header.provider}/${header.model} · thinking ${header.reasoning ?? "off"} · ${header.messages.length} messages · ${header.tools?.length ?? 0} tools`;
 		}
 		case "assistant/chunk": {
 			const chunk = event.data.chunk;

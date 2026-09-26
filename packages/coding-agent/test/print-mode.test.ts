@@ -26,6 +26,7 @@ type FakeSession = {
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
 	waitForIdle: ReturnType<typeof vi.fn>;
+	getContextTransitionGate: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -85,6 +86,12 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
 		waitForIdle: vi.fn(async () => {}),
+		getContextTransitionGate: vi.fn(() => ({
+			status: "ready",
+			subagentTasks: [],
+			requiredTaskIds: [],
+			subagentNoteEventId: null,
+		})),
 	};
 
 	return {
@@ -104,10 +111,25 @@ afterEach(() => {
 });
 
 describe("runPrintMode", () => {
+	it.each(["text", "json"] as const)(
+		"reports a blocked maintenance request without an assistant in %s mode",
+		async (mode) => {
+			const host = createRuntimeHost(createAssistantMessage());
+			host.session.state.messages = [];
+			host.session.state.runState = {
+				status: "idle",
+				lastOutcome: { type: "failed", message: "save_state_budget_exhausted" },
+			};
+			const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+			expect(await runPrintMode(host as unknown as Parameters<typeof runPrintMode>[0], { mode })).toBe(1);
+			expect(errors.mock.calls.flat().join(" ")).toContain("save_state_budget_exhausted");
+		},
+	);
 	it("waits for a Task that deferred context rollover before deciding the print run is incomplete", async () => {
 		const host = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		host.session.state.runState = { status: "idle", lastOutcome: { type: "context_transition" } };
 		let active = true;
+		host.session.getContextTransitionGate.mockImplementation(() => ({ status: active ? "busy" : "ready" }));
 		host.session.taskManager.list.mockImplementation(() => (active ? [{ taskId: "task-1", status: "running" }] : []));
 		host.session.taskManager.awaitSettled.mockImplementation(async () => {
 			active = false;

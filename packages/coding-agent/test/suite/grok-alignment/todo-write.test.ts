@@ -28,11 +28,11 @@ describe("todo_write (M9 eval: todo-write)", () => {
 		return harness.session.messages.filter((m) => m.role === "toolResult").pop();
 	}
 
-	it("is registered under the exact name todo_write", async () => {
+	it("is registered and active by default under the exact name todo_write", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		expect(harness.session.getAllTools().map((t) => t.name)).toContain("todo_write");
-		expect(harness.session.getActiveToolNames()).not.toContain("todo_write");
+		expect(harness.session.getActiveToolNames()).toContain("todo_write");
 	});
 
 	it("merge=true (default): existing items can be updated by status alone, without repeating content", async () => {

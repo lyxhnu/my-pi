@@ -40,7 +40,7 @@ export interface TodoWriteToolOptions {
 	/** Store backing this tool instance. Defaults to a fresh in-memory store. Pass one to share/observe state (e.g. for TodoNudge or session persistence). */
 	store?: TodoStateStore;
 	/**
-	 * Called after a successful mutation (merge or replace) with the store's latest snapshot. Used by
+	 * Persist the candidate snapshot before publishing the mutation to the store. Used by
 	 * AgentSession to persist TodoState into a session custom entry (spec 6.4: "session custom entry：
 	 * 供resume/reload恢复") so it survives session resume/reload, not just the live process.
 	 */
@@ -61,16 +61,18 @@ export function createTodoWriteToolDefinition(
 		promptSnippet: "Track multi-step work with a visible todo list",
 		parameters: todoWriteSchema,
 		async execute(_toolCallId, { merge, todos }: { merge?: boolean; todos: TodoUpdate[] }, _signal, _onUpdate, _ctx) {
+			const candidate = TodoStateStore.fromJSON(store.toJSON());
 			// Throws `DuplicateTodoIdError` on a duplicate id within this call; the
 			// agent loop turns that into a normal error tool result (see
 			// executePreparedToolCall's catch in packages/agent/src/agent-loop.ts).
 			if (merge === false) {
-				store.applyReplace(todos);
+				candidate.applyReplace(todos);
 			} else {
-				store.applyMerge(todos);
+				candidate.applyMerge(todos);
 			}
-			const snapshot = store.toJSON();
+			const snapshot = candidate.toJSON();
 			options?.onChange?.(snapshot);
+			store.replaceWith(candidate);
 			return {
 				content: [{ type: "text", text: store.summarize() }],
 				details: { todos: snapshot },

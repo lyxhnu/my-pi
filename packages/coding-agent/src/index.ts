@@ -17,6 +17,7 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type MemoryFlushResult,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

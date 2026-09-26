@@ -1,36 +1,55 @@
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { MemoryStore } from "../memory/memory-store.ts";
+import type { MemoryAuthority } from "../memory/memory-authority.ts";
+import type { MemoryQueryContext } from "../memory/types.ts";
 
-const memoryGetSchema = Type.Object({
-	path: Type.String({
-		description: 'Path returned by memory_search (or "MEMORY.md" for the global file), relative to the memory root.',
-	}),
-});
+const memoryGetSchema = Type.Object(
+	{
+		memoryId: Type.String({ description: "Memory ID returned by memory_search." }),
+		includeUnverified: Type.Optional(Type.Boolean()),
+		includeHistory: Type.Optional(Type.Boolean()),
+	},
+	{ additionalProperties: false },
+);
 
 export type MemoryGetToolInput = Static<typeof memoryGetSchema>;
 
 export function createMemoryGetToolDefinition(
-	store: MemoryStore,
-): ToolDefinition<typeof memoryGetSchema, { path: string }> {
+	authority: MemoryAuthority,
+	queryContext: () => MemoryQueryContext,
+): ToolDefinition<typeof memoryGetSchema, { memoryId: string; revision: number; relatedMemoryIds: string[] }> {
 	return {
 		name: "memory_get",
 		label: "memory_get",
 		description:
-			"Read the full content of a memory file by path (as returned by memory_search). Cannot escape the memory root.",
-		promptSnippet: "Read a memory file by path",
+			"Read one authorized long-term memory record by memory ID. Status and applicability checks are identical to memory_search.",
+		promptSnippet: "Read one verified memory record by ID",
 		parameters: memoryGetSchema,
 		async execute(_toolCallId, input: MemoryGetToolInput) {
-			const content = store.get(input.path);
-			if (content === undefined) {
-				throw new Error(`Could not read memory file "${input.path}" (not found, or outside the memory root).`);
-			}
-			return { content: [{ type: "text", text: content }], details: { path: input.path } };
+			const context = queryContext();
+			const options = {
+				includeUnverified: input.includeUnverified,
+				includeHistory: input.includeHistory,
+			};
+			const record = authority.getMemory(input.memoryId, context, options);
+			if (!record) throw new Error(`Memory record "${input.memoryId}" is unavailable in the current context.`);
+			const expanded = authority.search(record.subject, context, options, 1);
+			const records = expanded.some((candidate) => candidate.memoryId === record.memoryId) ? expanded : [record];
+			return {
+				content: [{ type: "text", text: JSON.stringify(records, null, 2) }],
+				details: {
+					memoryId: record.memoryId,
+					revision: record.revision,
+					relatedMemoryIds: records
+						.filter((candidate) => candidate.memoryId !== record.memoryId)
+						.map((candidate) => candidate.memoryId),
+				},
+			};
 		},
 		renderCall(args, theme) {
-			const path = typeof args?.path === "string" ? args.path : "";
-			return new Text(theme.fg("toolTitle", theme.bold(`memory_get ${path}`)), 0, 0);
+			const memoryId = typeof args?.memoryId === "string" ? args.memoryId : "";
+			return new Text(theme.fg("toolTitle", theme.bold(`memory_get ${memoryId}`)), 0, 0);
 		},
 	};
 }

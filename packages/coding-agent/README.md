@@ -191,7 +191,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/compact [prompt]` | Manually compact context, optional custom instructions |
 | `/shake` | Mechanically reduce large working-context blocks |
 | `/trace [list\|turn]` | Inspect current-branch execution trace |
-| `/memory flush [instructions]`, `/memory undo <id>` | Write project memory or revoke an entry |
+| `/memory remember <rule>`, `/memory flush`, `/memory status`, `/memory undo <memoryId>` | Manage project memory records and archive jobs |
 | `/copy` | Copy last assistant message to clipboard |
 | `/export [file]` | Export session to HTML or JSONL file |
 | `/import <file>` | Import and resume a session from a JSONL file |
@@ -277,7 +277,7 @@ Long sessions can exhaust context windows. Compaction summarizes older messages 
 
 **Manual:** `/compact` or `/compact <custom instructions>`
 
-**Automatic:** Enabled by default. Capacity pressure opens a fresh window after one bounded state-saving turn when space permits. The model can also request `new_context`. New windows start with an identity and recovery reference; requirements and notes are read on demand. Configure via `/settings` or `settings.json`.
+**Automatic:** Enabled by default. Capacity pressure first triggers deterministic Shake, then same-window Compaction if needed. If pressure remains, the model decides whether to request `new_context`; only that explicit intent permits a new window. Before transition it saves a Note and synchronizes Todo. The new window reads requirements, required Notes, and all unfinished Todo before resuming work. Configure via `/settings` or `settings.json`.
 
 Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
 

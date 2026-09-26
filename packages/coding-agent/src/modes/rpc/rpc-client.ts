@@ -7,9 +7,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
+import type { AgentSessionEvent, MemoryFlushResult, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { MemoryArchiveStatus } from "../../core/memory/types.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -37,6 +38,8 @@ export interface RpcClientOptions {
 	model?: string;
 	/** Additional CLI arguments */
 	args?: string[];
+	/** Maximum time to wait for one command response. Defaults to 300000 ms for model-backed commands. */
+	requestTimeoutMs?: number;
 }
 
 export interface ModelInfo {
@@ -317,23 +320,23 @@ export class RpcClient {
 		await this.send({ type: "set_auto_compaction", enabled });
 	}
 
-	/**
-	 * Manual memory flush (spec 10.5 Phase 1: "手动 /memory flush"). Summarizes the current session and
-	 * writes durable facts into *project* memory, without dropping any context (unlike compact()).
-	 */
-	async memoryFlush(
-		customInstructions?: string,
-	): Promise<{ attempted: boolean; written: number; skipped: number; warning?: string }> {
-		const response = await this.send({ type: "memory_flush", customInstructions });
+	async memoryRemember(text: string): Promise<{ memoryId: string; revision: number }> {
+		const response = await this.send({ type: "memory_remember", text });
 		return this.getData(response);
 	}
 
-	/**
-	 * Undo a previously written memory entry by id (spec 10.6: "/memory undo <id>"). Tombstones the
-	 * entry rather than deleting it from history. Scope defaults to "project" to match Memory.scope.default.
-	 */
-	async memoryUndo(entryId: string, scope: "global" | "project" = "project"): Promise<boolean> {
-		const response = await this.send({ type: "memory_undo", scope, entryId });
+	async memoryFlush(): Promise<MemoryFlushResult> {
+		const response = await this.send({ type: "memory_flush" });
+		return this.getData(response);
+	}
+
+	async memoryStatus(): Promise<MemoryArchiveStatus> {
+		const response = await this.send({ type: "memory_status" });
+		return this.getData(response);
+	}
+
+	async memoryUndo(memoryId: string): Promise<boolean> {
+		const response = await this.send({ type: "memory_undo", memoryId });
 		return this.getData<{ undone: boolean }>(response).undone;
 	}
 
@@ -583,7 +586,7 @@ export class RpcClient {
 			const timeout = setTimeout(() => {
 				this.pendingRequests.delete(id);
 				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
-			}, 30000);
+			}, this.options.requestTimeoutMs ?? 300_000);
 
 			this.pendingRequests.set(id, {
 				resolve: (response) => {

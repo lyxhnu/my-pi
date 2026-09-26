@@ -13,6 +13,12 @@ import {
 	type SessionManager,
 } from "./session-manager.ts";
 import {
+	type ContextTransitionGate,
+	captureSubagentHandoff,
+	type SubagentHandoff,
+	subagentRecoveryRecords,
+} from "./subagent-continuation.ts";
+import {
 	buildTaskNoteProjectionFromBranch,
 	createTaskNoteFreshnessResolver,
 	createTaskScopeId,
@@ -24,8 +30,9 @@ import {
 } from "./task-note-projection.ts";
 import type { ContextRecoveryReadPage, SessionTraceEvent } from "./trace.ts";
 
-export type ContextTransitionCause = "model_requested" | "work_budget_reached" | "provider_context_rejected";
-export interface ContextRecoveryReferences {
+export type ContextTransitionCause = "model_requested";
+export type ContextControlCause = ContextTransitionCause | "work_budget_reached" | "provider_context_rejected";
+export interface ContextRecoveryReferences extends SubagentHandoff {
 	saveStateOperationId: string;
 	nextActionEventId: string;
 	relatedNoteEventIds: string[];
@@ -49,7 +56,7 @@ export const RECOVERY_TOOL_NAMES = ["history", "context_note", "get_context_rema
 
 export interface SaveStateOperationSnapshot {
 	operationId: string;
-	transitionCause: ContextTransitionCause;
+	transitionCause: ContextControlCause;
 	windowId: string;
 	promptGeneration: number;
 	contextEpoch: number;
@@ -97,6 +104,7 @@ export interface ContextRolloverRevisions {
 export type ContextRolloverBlockedReason =
 	| "source_changed"
 	| "operation_in_flight"
+	| "subagent_handoff_invalid"
 	| "rollover_already_used"
 	| "rollover_limit"
 	| "recovery_unavailable"
@@ -108,6 +116,7 @@ export type ContextRolloverBlockedReason =
 	| "unchanged_request"
 	| "post_commit_mismatch"
 	| "dispatch_prepare_mismatch"
+	| "model_request_missing"
 	| "dispatch_outcome_unknown";
 export interface ContextRolloverRequest {
 	cause: ContextTransitionCause;
@@ -124,7 +133,7 @@ interface ContextRolloverDependencies {
 	agent: Agent;
 	manager: SessionManager;
 	revisions: () => ContextRolloverRevisions;
-	isBusy: () => boolean;
+	transitionGate: (retainedRequiredIds?: readonly string[]) => ContextTransitionGate;
 	isCancelled: () => boolean;
 	pendingDeliveryIds: () => readonly string[];
 	canRecover: (recovery?: ContextRecoveryReferences) => boolean;
@@ -172,6 +181,25 @@ function dedupeReferences(references: readonly TaskNoteReference[]): TaskNoteRef
 	});
 }
 
+/** The runtime, not the model's bounded dependency list, owns unfinished-task coverage. */
+function requiredTodoIds(items: unknown[], selected: readonly string[]): string[] {
+	return [
+		...new Set([
+			...selected,
+			...items.flatMap((item) =>
+				item !== null &&
+				typeof item === "object" &&
+				"id" in item &&
+				typeof item.id === "string" &&
+				"status" in item &&
+				(item.status === "pending" || item.status === "in_progress")
+					? [item.id]
+					: [],
+			),
+		]),
+	];
+}
+
 function referenceBlock(
 	historyById: ReadonlyMap<string, ReturnType<History["getItems"]>[number]>,
 	reference: TaskNoteReference,
@@ -193,6 +221,12 @@ export function currentContextRecoveryReferences(
 	if (projection.status !== "valid") throw new Error("recovery_reference_invalid");
 	const nextAction = projection.snapshot.items.find((item) => item.kind === "next_action" && item.key === "current");
 	if (!nextAction?.resume) throw new Error("recovery_reference_invalid");
+	subagentRecoveryRecords(
+		manager,
+		{ ...recovery, subagentNoteEventId: recovery.requiredTaskIds.length > 0 ? nextAction.eventId : null },
+		nextAction,
+	);
+	const handoff = captureSubagentHandoff(manager, scope, [], recovery.requiredTaskIds);
 	const related = nextAction.resume.relatedNotes.map((reference) =>
 		projection.snapshot.items.find((item) => item.kind === reference.kind && item.key === reference.key),
 	);
@@ -231,6 +265,7 @@ export function currentContextRecoveryReferences(
 		throw new Error("recovery_reference_invalid");
 	return {
 		...recovery,
+		...handoff,
 		nextActionEventId: nextAction.eventId,
 		relatedNoteEventIds: related.flatMap((item) => (item === undefined ? [] : [item.eventId])),
 		noteFreshness: [nextAction, ...related].flatMap((item) =>
@@ -238,7 +273,7 @@ export function currentContextRecoveryReferences(
 		),
 		requiredHistoryRefs,
 		requirementSourceRefs,
-		todoIds: [...nextAction.resume.todoIds],
+		todoIds: requiredTodoIds(todoItems, nextAction.resume.todoIds),
 		todoStateEntryId: todoEntry?.id ?? null,
 		todoStateFingerprint: fingerprintContextRolloverValue(todoEntry?.type === "custom" ? todoEntry.data : []),
 		taskNoteProjectionRevision: projection.snapshot.revision,
@@ -266,8 +301,22 @@ function recoveryWorkset(
 			taskNoteProjectionRevision: recovery.taskNoteProjectionRevision,
 			todoStateFingerprint: recovery.todoStateFingerprint,
 		},
+		subagents: subagentRecoveryRecords(
+			manager,
+			recovery,
+			projection?.status === "valid"
+				? projection.snapshot.items.find((item) => item.eventId === recovery.subagentNoteEventId)
+				: undefined,
+		),
 		notes:
-			projection?.status === "valid" ? projection.snapshot.items.filter((item) => noteIds.has(item.eventId)) : [],
+			projection?.status === "valid"
+				? projection.snapshot.items
+						.filter((item) => noteIds.has(item.eventId))
+						.map((item) => ({
+							...item,
+							resume: item.resume ? { ...item.resume, subagentContinuations: undefined } : undefined,
+						}))
+				: [],
 		history: historyReferences.map((reference) => {
 			const item = historyById.get(reference.entryId);
 			const block =
@@ -342,6 +391,7 @@ function branchTaskNoteProjection(
 }
 
 function isBusinessFact(entry: SessionEntry): boolean {
+	if (entry.type === "delivery_receipt") return true;
 	if (entry.type === "custom" && entry.customType === "todo-state") return true;
 	if (entry.type !== "message") return false;
 	if (entry.message.role === "user") return true;
@@ -420,7 +470,12 @@ export function validateContinuationState(
 	if (
 		!requirementSourceRefs.every((reference) => {
 			const entry = branch.find((candidate) => candidate.id === reference.entryId);
-			return entry?.type === "message" && entry.message.role === "user" && refIsReadable(reference);
+			return (
+				(entry?.type === "message" || entry?.type === "pending_delivery") &&
+				entry.message.role === "user" &&
+				readable.get(reference.entryId)?.role === "user" &&
+				refIsReadable(reference)
+			);
 		})
 	)
 		return { status: "invalid", reason: "requirement_source_invalid" };
@@ -446,7 +501,7 @@ export function validateContinuationState(
 		),
 		requiredHistoryRefs: dedupeReferences(nextAction.resume.requiredHistoryRefs),
 		requirementSourceRefs,
-		todoIds: [...nextAction.resume.todoIds],
+		todoIds: requiredTodoIds(todoItems, nextAction.resume.todoIds),
 	};
 }
 
@@ -629,6 +684,16 @@ export function contextRecoveryCoverage(
 		pageItems(record.page).some((item) => item.type === "next_action" && item.eventId === recovery.nextActionEventId),
 	);
 	const noteIntervals = new Map<string, RecoveryInterval[]>();
+	const expectedSubagents = new Map(
+		subagentRecoveryRecords(
+			manager,
+			recovery,
+			projection?.status === "valid"
+				? projection.snapshot.items.find((item) => item.eventId === recovery.subagentNoteEventId)
+				: undefined,
+		).map((item) => [item.taskId, item.text]),
+	);
+	const subagentIntervals = new Map<string, RecoveryInterval[]>();
 	const historyIntervals = new Map<string, RecoveryInterval[]>();
 	const todoIntervals = new Map<string, RecoveryInterval[]>();
 	const discoveries = new Set<string>();
@@ -636,6 +701,16 @@ export function contextRecoveryCoverage(
 	for (const record of notePages) {
 		let relevantPage = false;
 		for (const item of pageItems(record.page)) {
+			if (item.type === "subagent_task" && typeof item.taskId === "string") {
+				const expected = expectedSubagents.get(item.taskId);
+				if (expected !== undefined && intervalMatchesText(item, expected)) {
+					const intervals = subagentIntervals.get(item.taskId) ?? [];
+					intervals.push({ offset: item.offset, end: item.end, total: item.total });
+					subagentIntervals.set(item.taskId, intervals);
+					discoveries.add(`subagent:${item.taskId}`);
+					relevantPage = true;
+				}
+			}
 			if (typeof item.eventId === "string" && requiredNoteIds.has(item.eventId)) {
 				discoveries.add(`note:${item.eventId}`);
 				relevantPage = true;
@@ -726,6 +801,9 @@ export function contextRecoveryCoverage(
 	}
 
 	const missing: string[] = [];
+	for (const taskId of expectedSubagents.keys()) {
+		if (!intervalsCoverTotal(subagentIntervals.get(taskId) ?? [])) missing.push(`subagent:${taskId}`);
+	}
 	if (!resumeResolved) missing.push(`resume:${recovery.nextActionEventId}`);
 	for (const eventId of [recovery.nextActionEventId, ...recovery.relatedNoteEventIds]) {
 		if (!intervalsCoverTotal(noteIntervals.get(eventId) ?? [])) missing.push(`note:${eventId}`);
@@ -740,13 +818,19 @@ export function contextRecoveryCoverage(
 	}
 	const progress = {
 		resumeResolved,
+		subagents: [...subagentIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
 		discoveries: [...discoveries].sort(),
 		cursors: [...relevantCursors].sort(),
 		notes: [...noteIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
 		history: [...historyIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
 		todos: [...todoIntervals.entries()].map(([key, intervals]) => [key, normalizedIntervals(intervals)]),
 	};
-	const coveredCharacters = [...noteIntervals.values(), ...historyIntervals.values(), ...todoIntervals.values()]
+	const coveredCharacters = [
+		...subagentIntervals.values(),
+		...noteIntervals.values(),
+		...historyIntervals.values(),
+		...todoIntervals.values(),
+	]
 		.flatMap(normalizedIntervals)
 		.reduce((total, interval) => total + interval.end - interval.offset, 0);
 	return {
@@ -768,6 +852,18 @@ export function validateCommittedRecovery(manager: SessionManager, rollover: Con
 	if (!scope || scope.taskScopeId !== rollover.recovery.taskScopeId) return false;
 	const projection = buildTaskNoteProjectionFromBranch(committedBranch, scope);
 	if (projection.status !== "valid") return false;
+	try {
+		const handoff = rollover.recovery;
+		if (handoff.subagentTasks.some((ref) => !committedBranch.some((entry) => entry.id === ref.sourceEntryId)))
+			return false;
+		subagentRecoveryRecords(
+			manager,
+			handoff,
+			projection.snapshot.items.find((item) => item.eventId === handoff.nextActionEventId),
+		);
+	} catch {
+		return false;
+	}
 	const expectedNotes = [rollover.recovery.nextActionEventId, ...rollover.recovery.relatedNoteEventIds];
 	if (!expectedNotes.every((eventId) => projection.snapshot.items.some((item) => item.eventId === eventId)))
 		return false;
@@ -835,13 +931,12 @@ export function validateContextRecovery(
 		throw new Error("recovery_unavailable");
 	const windowEntry = [...branch]
 		.reverse()
-		.find(
-			(entry) => entry.type === "context_window" || entry.type === "context_rollover" || entry.type === "compaction",
-		);
+		.find((entry) => entry.type === "context_window" || entry.type === "context_rollover");
 	const windowIndex = windowEntry ? branch.indexOf(windowEntry) : -1;
 	collectCompleteToolTransactions(branch.slice(Math.max(0, windowIndex + 1)));
 	return {
 		saveStateOperationId: operation.operationId,
+		...captureSubagentHandoff(manager, scope, []),
 		nextActionEventId: continuation.nextActionEventId,
 		relatedNoteEventIds: continuation.relatedNoteEventIds,
 		noteFreshness: continuation.noteFreshness,
@@ -884,7 +979,7 @@ export class ContextRollover {
 		}
 	}
 	private async execute(request: ContextRolloverRequest): Promise<ContextRolloverOutcome> {
-		const { agent, manager, revisions, isBusy, isCancelled, onTrace } = this.dependencies;
+		const { agent, manager, revisions, transitionGate, isCancelled, onTrace } = this.dependencies;
 		const rolloverId = randomUUID();
 		const identity = createContextWindowIdentity(manager.getBranch());
 		const coordinates = manager.getLatestContextCoordinates();
@@ -907,9 +1002,26 @@ export class ContextRollover {
 			onTrace({ ...base, ...diagnostics, phase: "rollover", outcome: "blocked", reasonCode: reason });
 			return { outcome: "blocked", reason };
 		};
+		let requiredTaskIds: string[] = [];
 		for (let attempt = 0; attempt < 2; attempt++) {
 			if (isCancelled()) return { outcome: "cancelled" };
-			if (isBusy()) return block("operation_in_flight");
+			if (
+				request.cause !== "model_requested" ||
+				!manager
+					.getBranch()
+					.some(
+						(entry) =>
+							entry.type === "context_transition_request" &&
+							entry.requestId === request.requestId &&
+							entry.windowId === request.windowId &&
+							entry.promptGeneration === coordinates.promptGeneration,
+					)
+			)
+				return block("model_request_missing");
+			const gate = transitionGate(requiredTaskIds);
+			if (gate.status === "busy") return block("operation_in_flight");
+			if (gate.status === "invalid") return block(gate.reason);
+			requiredTaskIds = gate.requiredTaskIds;
 			if (!this.dependencies.canRecover()) return block("recovery_unavailable");
 			if (attempt > 0) request = { ...request, ...(await this.dependencies.measureSource()) };
 			if (
@@ -929,12 +1041,19 @@ export class ContextRollover {
 			const expected = revisions();
 			let recovery: ContextRecoveryReferences;
 			try {
-				recovery = validateContextRecovery(manager, expected);
+				recovery = {
+					...validateContextRecovery(manager, expected),
+					subagentTasks: gate.subagentTasks,
+					requiredTaskIds,
+					subagentNoteEventId: gate.subagentNoteEventId,
+				};
 			} catch (error) {
 				return block(
-					error instanceof Error && error.message === "tool_transaction_incomplete"
-						? "tool_transaction_incomplete"
-						: "continuation_state_changed",
+					error instanceof Error && error.message === "subagent_handoff_invalid"
+						? "subagent_handoff_invalid"
+						: error instanceof Error && error.message === "tool_transaction_incomplete"
+							? "tool_transaction_incomplete"
+							: "continuation_state_changed",
 				);
 			}
 			if (!this.dependencies.canRecover(recovery)) return block("recovery_unavailable");
@@ -993,14 +1112,17 @@ export class ContextRollover {
 				agent.releasePreparedContinuation(preparation);
 				return block("unchanged_request");
 			}
+			const preparedGate = transitionGate(requiredTaskIds);
 			if (
 				isCancelled() ||
-				isBusy() ||
+				preparedGate.status !== "ready" ||
 				!this.dependencies.canRecover(recovery) ||
 				JSON.stringify(revisions()) !== JSON.stringify(expected)
 			) {
 				agent.releasePreparedContinuation(preparation);
 				if (isCancelled()) return { outcome: "cancelled" };
+				if (preparedGate.status === "invalid") return block(preparedGate.reason);
+				if (preparedGate.status === "busy") return block("operation_in_flight");
 				if (attempt === 0) continue;
 				return block("source_changed");
 			}
@@ -1012,7 +1134,8 @@ export class ContextRollover {
 					recovery.relatedNoteEventIds.length +
 					recovery.requiredHistoryRefs.length +
 					recovery.requirementSourceRefs.length +
-					recovery.todoIds.length;
+					recovery.todoIds.length +
+					recovery.subagentTasks.length;
 				const pageCount = Math.max(minimumPages, Math.ceil(estimateTextTokens(workset) / 2048));
 				worksetBudget = await agent.measurePreparedContinuation(
 					preparation,
@@ -1063,14 +1186,17 @@ export class ContextRollover {
 				agent.releasePreparedContinuation(preparation);
 				return block("recovery_workset_too_large", worksetDiagnostics);
 			}
+			const commitGate = transitionGate(requiredTaskIds);
 			if (
 				isCancelled() ||
-				isBusy() ||
+				commitGate.status !== "ready" ||
 				!this.dependencies.canRecover(recovery) ||
 				JSON.stringify(revisions()) !== JSON.stringify(expected)
 			) {
 				agent.releasePreparedContinuation(preparation);
 				if (isCancelled()) return { outcome: "cancelled" };
+				if (commitGate.status === "invalid") return block(commitGate.reason);
+				if (commitGate.status === "busy") return block("operation_in_flight");
 				if (attempt === 0) continue;
 				return block("source_changed");
 			}
@@ -1182,7 +1308,12 @@ export class ContextRollover {
 				last.stopReason === "error" &&
 				last.content.every((block) => block.type !== "toolCall") &&
 				isContextOverflow(last, agent.state.model.contextWindow);
-			if (outcome === "failed" && !rejected && !failureMessage?.startsWith("recovery_")) {
+			if (
+				outcome === "failed" &&
+				!rejected &&
+				!failureMessage?.startsWith("recovery_") &&
+				failureMessage !== "subagent_handoff_invalid"
+			) {
 				onTrace({ ...trace, outcome: "outcome_unknown", reasonCode: "dispatch_outcome_unknown" });
 				return { outcome: "blocked", reason: "dispatch_outcome_unknown" };
 			}
@@ -1193,6 +1324,7 @@ export class ContextRollover {
 					? "context_limit"
 					: outcome === "context_limit" ||
 							outcome === "context_transition" ||
+							outcome === "context_maintenance" ||
 							outcome === "aborted" ||
 							outcome === "failed"
 						? outcome
@@ -1208,14 +1340,16 @@ export class ContextRollover {
 		record: ContextRolloverEntry,
 		options: { continueRun: boolean; recovering: boolean },
 	): Promise<ContextRolloverOutcome> {
-		const { agent, manager, isBusy, isCancelled, onTrace } = this.dependencies;
+		const { agent, manager, transitionGate, isCancelled, onTrace } = this.dependencies;
 		const data = {
 			dispatchId: record.dispatchId,
 			rolloverId: record.rolloverId,
 			requestFingerprint: record.preparedRequestFingerprint,
 		};
 		if (isCancelled()) return { outcome: "cancelled" };
-		if (isBusy()) return { outcome: "blocked", reason: "operation_in_flight" };
+		const gate = transitionGate();
+		if (gate.status !== "ready")
+			return { outcome: "blocked", reason: gate.status === "busy" ? "operation_in_flight" : gate.reason };
 		if (!options.continueRun) {
 			manager.appendContextRolloverDispatch({ ...data, state: "finished", outcome: "completed" });
 			onTrace({
@@ -1253,7 +1387,9 @@ export class ContextRollover {
 			.reverse()
 			.find((entry) => entry.type === "context_rollover" && entry.rolloverId === state.rolloverId);
 		if (record?.type !== "context_rollover") return undefined;
-		if (this.dependencies.isBusy()) return { outcome: "blocked", reason: "operation_in_flight" };
+		const gate = this.dependencies.transitionGate();
+		if (gate.status !== "ready")
+			return { outcome: "blocked", reason: gate.status === "busy" ? "operation_in_flight" : gate.reason };
 		if (
 			!this.dependencies.canRecover() ||
 			record.dispatchId !== createContextRolloverDispatchId(record.rolloverId, record.preparedRequestFingerprint)

@@ -17,6 +17,8 @@ Common options:
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
 
+The TypeScript `RpcClient` waits up to 300 seconds for a command response by default because `compact` and `memory_flush` can perform model calls. Set `requestTimeoutMs` in `RpcClientOptions` when the embedding host needs a different bound.
+
 ## Protocol Overview
 
 - **Commands**: JSON objects sent to stdin, one per line
@@ -193,7 +195,7 @@ Response:
 
 The `model` field is a full [Model](#model) object or `null`. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set.
 
-`runState` is `RpcAgentRunState`, the JSON representation of agent-core's discriminated `AgentRunState`. An idle state has an optional `lastOutcome`: `completed`, `failed`, `aborted`, `context_limit`, or `context_transition`. The last two are incomplete outcomes; `context_limit` also includes `budget`. A running state includes `runId`, `turn`, and `phase`; `executing_tools.pendingToolCallIds` is an array, not a JavaScript Set. Await `agent_settled`, then call `get_state` to distinguish final completion from an intermediate stop that is followed by a window transition. `windowId` is the current persisted UUID (null before the initial window exists); `contextEpoch`, `rolloverCount`, and `dispatchState` expose continuation state. `outcome_unknown` must not be automatically replayed.
+`runState` is `RpcAgentRunState`, the JSON representation of agent-core's discriminated `AgentRunState`. An idle state has an optional `lastOutcome`: `completed`, `failed`, `aborted`, `context_limit`, `context_maintenance`, or `context_transition`. The last three are incomplete outcomes; `context_limit` also includes `budget`. A running state includes `runId`, `turn`, and `phase`; `executing_tools.pendingToolCallIds` is an array, not a JavaScript Set. Await `agent_settled`, then call `get_state` to distinguish final completion from an intermediate stop followed by maintenance or a window transition. `windowId` is the current persisted UUID (null before the initial window exists); `contextEpoch`, `rolloverCount`, and `dispatchState` expose continuation state. `outcome_unknown` must not be automatically replayed.
 
 #### get_messages
 
@@ -415,7 +417,7 @@ Response:
 
 #### set_auto_compaction
 
-Enable or disable automatic window transitions and deterministic shake when context is nearly full. Explicit `compact` remains a separate summary operation.
+Enable or disable automatic Shake, same-window Compaction, and bounded model window decisions when context is nearly full. Only explicit model intent permits a window transition. Explicit `compact` uses the shared summary operation.
 
 ```json
 {"type": "set_auto_compaction", "enabled": true}
@@ -428,14 +430,16 @@ Response:
 
 ### Memory
 
-`memory_flush` and `memory_undo` are the RPC equivalents of the interactive `/memory` commands; sending the TUI command text via `prompt` is not equivalent.
+`memory_remember`, `memory_flush`, `memory_status`, and `memory_undo` are the RPC equivalents of the interactive `/memory` commands; sending the TUI command text via `prompt` is not equivalent.
 
 ```json
-{"id":"flush-1","type":"memory_flush","customInstructions":"Keep durable project conventions"}
-{"id":"undo-1","type":"memory_undo","scope":"project","entryId":"mem-example"}
+{"id":"remember-1","type":"memory_remember","text":"Run targeted tests after code changes."}
+{"id":"flush-1","type":"memory_flush"}
+{"id":"status-1","type":"memory_status"}
+{"id":"undo-1","type":"memory_undo","memoryId":"mem-example"}
 ```
 
-Flush returns `{ attempted, written, skipped, reasons, warning? }` in `data`. `success: true` means the command ran, not that a candidate was written. Check `written`, `skipped` and fixed `reasons` such as `secret_pattern`, `high_entropy_token` or `memory_flush_failed`. Rejected candidate text is not included. Undo returns `{ undone: boolean }` and affects subsequent effective-view reads/searches without rewriting the source Markdown. See [memory and context](memory-context.md).
+Remember writes an explicit project-scoped user rule through the authority transaction. Flush returns `{ attempted, status, jobId?, manifestId?, written, skipped, remainingSources, reasons }`; `success: true` means the command ran, while `status` and the counters report archive progress. Status returns record, evidence, failure, budget, and job counts. Undo accepts only a `memoryId`, writes a revoked revision, and immediately removes that record from default search/get results. See [memory and context](memory-context.md).
 
 ### Retry
 
@@ -581,7 +585,7 @@ Response:
 }
 ```
 
-`tokens` and `cost` include assistant messages, usage reported by tools, manual compaction/branch-summary generation and traced memory extraction across the full session. `contextUsage` is the footer estimate, not the authoritative next-request budget; use `context_budget` events for the final transformed request.
+`tokens` and `cost` include assistant messages, usage reported by tools, compaction/branch-summary generation and traced memory extraction across the full session. `contextUsage` is the footer estimate, not the authoritative next-request budget; use `context_budget` events for the final transformed request.
 
 `contextUsage` is omitted when no model or context window is available. `contextUsage.tokens` and `contextUsage.percent` are `null` immediately after compaction until a fresh post-compaction assistant response provides valid usage data.
 
@@ -906,9 +910,9 @@ Emitted after the full session-level run settles. Inspect `get_state.runState.la
 
 Every main-model request is checked after message transforms, conversion and append-only context assembly, before provider dispatch. `context_budget` carries a `budget` object with `tokens`, `usageTokens`, `trailingTokens`, `lastUsageIndex`, `contextWindow`, `modelMaxOutputTokens`, `requestedMaxOutputTokens`, `outputReserveTokens`, `safetyTokens`, `availableOutputTokens`, `unknownFields`, and `decision` (`fits`, `context_limit`, or `unknown`). Unknown metadata is not evidence that the request fits.
 
-A rejected hard preflight returns `{ type: "context_limit", budget }`; automatic window control or a model request returns `{ type: "context_transition" }`. No synthetic assistant response is emitted. The session prepares and validates a minimal new window after the accepted tool batch finishes, with at most eight commits per prompt. A single bounded state-saving turn may precede transition when capacity allows. A blocked transition remains incomplete in `get_state`; prompt acceptance is unchanged.
+A rejected hard preflight returns `{ type: "context_limit", budget }`. Automatic capacity control returns `{ type: "context_maintenance" }` to the session after the accepted tool batch finishes. The session tries Shake, then same-window Compaction, measuring the final request after each step. Remaining pressure enters bounded model decision/state saving. Only a persisted `new_context` intent permits `{ type: "context_transition" }` and a new window, with at most eight commits per prompt. No synthetic assistant response is emitted. Unresolved maintenance or transition remains incomplete in `get_state`; prompt acceptance is unchanged.
 
-Budget, window transitions, manual summary and archive decisions are persisted as log-only trace entries (`context/budget`, `context/rollover`, `compaction/summary`, `memory/archive`). Window traces include window ID, cause, commit/dispatch phase and blocking reason. They are available through `get_entries` even if no provider request was sent. Do not use `get_last_assistant_text` as a completion signal.
+Budget, window transitions, summary and archive decisions are persisted as log-only trace entries (`context/budget`, `context/rollover`, `compaction/summary`, `memory/archive`). Window traces include window ID, cause, commit/dispatch phase and blocking reason. Durable `context-maintenance` custom entries record consumed reduction attempts. They are available through `get_entries` even if no provider request was sent. Do not use `get_last_assistant_text` as a completion signal.
 
 ### turn_start / turn_end
 
@@ -1050,13 +1054,13 @@ Emitted whenever the pending steering or follow-up queue changes.
 
 ### compaction_start / compaction_end
 
-Emitted for explicit manual compaction. Automatic window transitions use `context/rollover` traces.
+Emitted for automatic and explicit manual compaction. Hard window transitions use `context/rollover` traces.
 
 ```json
 {"type": "compaction_start", "reason": "manual"}
 ```
 
-The `reason` field is `"manual"`.
+The `reason` field is `"manual"`, `"threshold"`, or `"overflow"`.
 
 ```json
 {

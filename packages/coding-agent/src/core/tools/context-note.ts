@@ -23,7 +23,12 @@ import type { SessionTraceEvent } from "../trace.ts";
 const referenceSchema = Type.Object(
 	{
 		entryId: Type.String({ minLength: 1, maxLength: 128 }),
-		blockIndex: Type.Optional(Type.Integer({ minimum: 0 })),
+		blockIndex: Type.Optional(
+			Type.Integer({
+				minimum: -1,
+				description: "Use the exact History block index; -1 identifies a whole-text source.",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -48,6 +53,16 @@ const resumeSchema = Type.Object(
 		requiredHistoryRefs: Type.Array(referenceSchema, { maxItems: MAX_TASK_NOTE_RESUME_REFS }),
 		requirementSourceRefs: Type.Array(referenceSchema, { maxItems: MAX_TASK_NOTE_RESUME_REFS }),
 		todoIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: MAX_TASK_NOTE_RESUME_REFS }),
+		subagentContinuations: Type.Array(
+			Type.Object(
+				{
+					taskId: Type.String({ minLength: 1, maxLength: 128 }),
+					parentRelation: Type.String({ minLength: 1, maxLength: MAX_TASK_NOTE_TEXT_CHARS }),
+					onResult: Type.String({ minLength: 1, maxLength: MAX_TASK_NOTE_TEXT_CHARS }),
+				},
+				{ additionalProperties: false },
+			),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -75,7 +90,7 @@ const contextNoteSchema = Type.Union([
 			key: Type.String({ pattern: "^[a-z0-9][a-z0-9._/-]{0,95}$" }),
 			text: Type.String({ minLength: 1, maxLength: MAX_TASK_NOTE_TEXT_CHARS }),
 			sourceRefs: Type.Array(referenceSchema, { minItems: 1, maxItems: MAX_TASK_NOTE_SOURCE_REFS }),
-			evidenceRefs: Type.Array(referenceSchema, { maxItems: MAX_TASK_NOTE_EVIDENCE_REFS }),
+			evidenceRefs: Type.Optional(Type.Array(referenceSchema, { maxItems: MAX_TASK_NOTE_EVIDENCE_REFS })),
 			resume: Type.Optional(resumeSchema),
 			supersedesEventId: Type.Optional(Type.String({ minLength: 1 })),
 		},
@@ -125,7 +140,12 @@ export function createContextNoteToolDefinition(
 			"Call context_note only when losing the fact would change how the task should continue.",
 			"Task notes index authoritative session evidence; they do not replace user messages, tool results, or todos.",
 			"Use history to discover persisted sourceRefs and evidenceRefs. Query Note metadata first, then request an item by eventId to read its text and freshness. Resolve resumeRef with operation=query.",
+			"Use kind=next_action and key=current for the continuation Note. Only this identity accepts resume; include all five resume fields. Other Note identities must omit resume.",
+			"resume.subagentContinuations is required (empty if no subagents). For every task delegated in this task scope, every still-running earlier child, and any other referenced child, record taskId, parentRelation (dependent parent step or independent work), and onResult (checks, result use and next action, or evidence it was already handled). Terminal/read does not mean handled. Use original task results for IDs; do not redelegate just because context changed.",
+			`Preserve History blockIndex values exactly, including -1 for whole-text sources. resume.todoIds accepts at most ${MAX_TASK_NOTE_RESUME_REFS} directly required Todo IDs; runtime recovery includes every unfinished Todo even when not selected there.`,
+			'For a new Note, use the minimal shape {"operation":"upsert","kind":"constraint","key":"stable-key","text":"...","sourceRefs":[{"entryId":"...","blockIndex":0}]}; evidenceRefs and resume are optional. Put requiredHistoryRefs, requirementSourceRefs, relatedNotes, and todoIds only inside resume.',
 			"When updating or retracting an active Note, pass its eventId as supersedesEventId; omit supersedesEventId when creating a new Note identity.",
+			"Never send an empty supersedesEventId.",
 		],
 		parameters: contextNoteSchema,
 		async execute(toolCallId, input) {
@@ -148,7 +168,8 @@ export function createContextNoteToolDefinition(
 					throw error;
 				}
 			}
-			const candidate = input as TaskNoteCandidate;
+			const candidate: TaskNoteCandidate =
+				input.operation === "upsert" ? { ...input, evidenceRefs: input.evidenceRefs ?? [] } : input;
 			const reject = (reason: string): never => {
 				options.onTrace?.({
 					type: "context/task_note",

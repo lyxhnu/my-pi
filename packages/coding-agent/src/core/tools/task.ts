@@ -120,7 +120,7 @@ export function createTaskToolDefinition(
 			}
 			if (!isSubagentTaskResult(snapshot.result)) throw new Error("Subagent task returned no structured result.");
 			return {
-				content: [{ type: "text", text: JSON.stringify(snapshot.result) }],
+				content: [{ type: "text", text: JSON.stringify({ taskId: handle.taskId, ...snapshot.result }) }],
 				details: { taskId: handle.taskId, result: snapshot.result },
 			};
 		},

@@ -1,7 +1,7 @@
 import type { ContextBudget } from "@earendil-works/pi-ai";
 
 export const STATE_SAVE_OUTPUT_TOKENS = 2048;
-// One bounded Note mutation plus its control response. Output is reserved separately.
+// Bounded decision, Todo synchronization and Note saving. Output is reserved separately.
 export const STATE_SAVE_CONTROL_TOKENS = 3072;
 
 export interface ContextReadBudgetReservation {
@@ -18,7 +18,7 @@ export interface ContextRemaining {
 	remainingWorkTokens: number | null;
 	remainingControlTokens: number | null;
 	measurement: "usage_anchored_estimate" | "estimate" | "unknown";
-	phase: "normal" | "save_state" | "recovering";
+	phase: "normal" | "maintenance" | "decision" | "save_state" | "recovering";
 }
 
 export function contextRemaining(
@@ -53,7 +53,7 @@ export function contextRemaining(
 		measurement: !known ? "unknown" : budget.lastUsageIndex === null ? "estimate" : "usage_anchored_estimate",
 		phase:
 			phase === "normal" && (budget.decision === "context_limit" || remainingWorkTokens === 0)
-				? "save_state"
+				? "maintenance"
 				: phase,
 	};
 }

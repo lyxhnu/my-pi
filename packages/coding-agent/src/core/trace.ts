@@ -9,6 +9,8 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import type { ContextRolloverBlockedReason, ContextTransitionCause } from "./context-rollover.ts";
+import type { ExecutionMetrics } from "./execution-monitor.ts";
+import type { ExecutionUpgradeOutcome } from "./execution-upgrade.ts";
 import type { TaskNoteKind } from "./task-note-projection.ts";
 import type { TaskKind, TaskStatus } from "./tasks/types.ts";
 
@@ -52,6 +54,28 @@ export type TraceAssistantChunk =
 
 /** Log-only trace vocabulary stored beside the normal session entries. */
 export type SessionTraceEvent =
+	| {
+			type: "execution/status";
+			data: {
+				turn: number;
+				step: number;
+				sessionId: string;
+				promptGeneration: number;
+				metrics: ExecutionMetrics;
+				reminder: boolean;
+			};
+	  }
+	| {
+			type: "execution/upgrade";
+			data: {
+				turn: number;
+				step: number;
+				sessionId: string;
+				promptGeneration: number;
+				taskId?: string;
+				outcome: ExecutionUpgradeOutcome;
+			};
+	  }
 	| { type: "turn/start"; data: { turn: number } }
 	| {
 			type: "turn/end";
@@ -69,6 +93,16 @@ export type SessionTraceEvent =
 			data: { turn: number; step: number; stopReason?: StopReason; usage?: Usage };
 	  }
 	| { type: "request/header"; data: { turn: number; step: number; header: TraceRequestHeader } }
+	| {
+			type: "task/request";
+			data: {
+				turn: number;
+				taskId: string;
+				sessionId: string;
+				promptGeneration: number;
+				header: TraceRequestHeader;
+			};
+	  }
 	| { type: "context/budget"; data: { turn: number; step: number; budget: ContextBudget } }
 	| {
 			type: "context/save_state";
@@ -148,7 +182,12 @@ export type SessionTraceEvent =
 			type: "memory/archive";
 			data: {
 				turn: number;
-				compactionId: string;
+				compactionId?: string;
+				rootPromptId?: string;
+				sourceEntryId?: string;
+				jobId?: string;
+				manifestId?: string;
+				phase?: "evidence" | "sealed" | "processing" | "completed" | "failed";
 				ran: boolean;
 				reason: string;
 				written?: number;

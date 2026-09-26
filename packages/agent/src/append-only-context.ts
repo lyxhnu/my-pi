@@ -19,7 +19,6 @@
  */
 
 import type { Context, Message } from "@earendil-works/pi-ai";
-import type { AgentContext } from "./types.ts";
 
 /** Frozen system prompt + tool spec snapshot. */
 export interface StablePrefixSnapshot {
@@ -53,7 +52,7 @@ export class StablePrefix {
 	}
 
 	/** Build or rebuild from live context. Returns true when the prefix actually changed. */
-	build(context: AgentContext): boolean {
+	build(context: Pick<Context, "systemPrompt" | "tools">): boolean {
 		const snapshot = takeSnapshot(context);
 		if (this.#snapshot && this.#snapshot.fingerprint === snapshot.fingerprint) {
 			return false;
@@ -172,7 +171,7 @@ export class AppendOnlyContextManager {
 		if (isSwitch) this.invalidateForModelChange();
 	}
 
-	build(context: AgentContext): Context {
+	build(context: Pick<Context, "systemPrompt" | "tools">): Context {
 		this.prefix.build(context);
 		const { systemPrompt, tools } = this.prefix.toContext();
 		return { systemPrompt, messages: this.log.toMessages(), tools };
@@ -293,13 +292,13 @@ function messageDigest(message: unknown): number {
 	);
 }
 
-function takeSnapshot(context: AgentContext): StablePrefixSnapshot {
-	const systemPrompt = context.systemPrompt;
+function takeSnapshot(context: Pick<Context, "systemPrompt" | "tools">): StablePrefixSnapshot {
+	const systemPrompt = context.systemPrompt ?? "";
 	const tools = context.tools?.slice() as Context["tools"];
 	return { systemPrompt, tools, fingerprint: computeFingerprint(systemPrompt, context.tools) };
 }
 
-function computeFingerprint(systemPrompt: string, tools: AgentContext["tools"]): string {
+function computeFingerprint(systemPrompt: Context["systemPrompt"], tools: Context["tools"]): string {
 	return hashString(
 		JSON.stringify({
 			s: systemPrompt,

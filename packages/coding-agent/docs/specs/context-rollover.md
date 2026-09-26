@@ -146,7 +146,7 @@ Checkpoint 结束位置、Compaction 保留起点和 Active Suffix 起点均不�
 | R18 | Pending Delivery 正文只进入 Session 权威记录和真实请求，不进入 Trace 或 Handoff Note |
 | R19 | Handoff 不扩大系统指令、工具权限或用户授权 |
 | R20 | history_get 只开放 Shake ancestor 或最新 Handoff 精确列出的 entry/block |
-| R21 | 组装时有前台工具、待确认交互或 running/cancelling Task 时不得提交 |
+| R21 | 组装时父工具批次未完整、存在待确认交互或 active 非 subagent Task 时不得提交；已返回原 ID 的内置子任务按子 Agent 跨窗 Spec 校验交接，校验通过不等待终态 |
 | R22 | 无法证明交接完整、请求一致或执行不会自动重放时必须停止 |
 
 ## 7. 模块与接口
@@ -545,7 +545,7 @@ AND taskIsIncomplete
 
 - 没有前台 tool call；
 - PendingInteractionRegistry 为空；
-- TaskManager 没有 running/cancelling task；
+- TaskManager 没有 running/cancelling 的非 subagent task；内置子任务的委派来源、父任务关系和结果处理计划满足 [子 Agent 跨窗 Spec](subagent-context-rollover.md)，缺失时明确返回 subagent_handoff_invalid；
 - 有有效 Checkpoint，或正在等待同 epoch 既有 Checkpoint；
 - 当前 epoch 尚未 rollover；
 - 当前 prompt rollover 次数少于 8；
@@ -831,7 +831,7 @@ verification 不从模型文本或“输出发生变化”推断，只由以下�
 - 用户 abort 取消未提交的 Checkpoint/Rollover，释放 preparation；已提交但未 started 时必须先追加 dispatch cancelled entry，RolloverEntry 不删除。
 - dispatch_started 后 abort 通过 Agent 正常结算为 aborted；若在落盘 finished 前 crash，则按 outcome unknown 处理。
 - PendingInteraction 未解决时不得把未获得授权写入 Handoff。
-- running/cancelling Task 必须先到终态，Rollover 不取消它们。
+- running/cancelling 的非 subagent Task 必须先到终态；已交接内置子任务可使用原 TaskManager 跨窗运行，Rollover 不取消或重建任务。父工具批次、版本比较、正文恢复覆盖和预算门禁继续有效。
 
 ## 19. 失败原因
 
@@ -862,6 +862,7 @@ export type ContextRolloverBlockedReason =
   | "tool_transaction_incomplete"
   | "active_suffix_too_large"
   | "handoff_invalid"
+  | "subagent_handoff_invalid"
   | "source_changed"
   | "todo_changed"
   | "queue_changed"
@@ -1036,7 +1037,7 @@ export type ContextRolloverWarning = "trace_write_failed" | "ui_notification_fai
 | TG08 | Provider/auth/network/permission 错误 | 不评估 rollover |
 | TG09 | 只有 next_prompt pending | 不视为当前任务未完成 |
 | TG10 | 前台工具或 PendingInteraction 活动 | 不提交，稳定后重新测量 |
-| TG11 | TaskManager running/cancelling | 不提交、不取消任务 |
+| TG11 | TaskManager running/cancelling | 非 subagent 继续等待；已交接内置子任务不等待终态，缺失交接明确失败；均不因换窗取消任务 |
 | TG12 | 当前 epoch 已 rollover | blocked(rollover_already_used) |
 | TG13 | 当前 prompt 已 8 次 rollover | blocked(rollover_limit) |
 

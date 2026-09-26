@@ -1,14 +1,20 @@
 # 记忆与上下文
 
-自动容量管理使用稳定窗口和按需检索。设计契约见 [窗口记忆 Spec](specs/context-window-memory-proposal.md)。手动 [/compact](compaction.md) 和确定性 /shake 保持独立。
+自动容量管理采用 **Shake → Compaction → 模型决策换窗**。设计契约见 [渐进式短期记忆 Spec](specs/context-engineering-progressive-memory.md)。手动 [/compact](compaction.md) 和确定性 /shake 仍可单独使用。
 
 ## 窗口与恢复
 
-首次请求前持久化 windowId。换窗、分支和手动压缩建立新身份，并记录 previousWindowId。自动换窗后的首个请求只包含常规 system/tools 和不超过 512 个估算 token 的 bootstrap：窗口 ID、resume_ref、恢复指令。旧消息后缀、Todo 和 Note 正文不会自动注入。
+首次请求前持久化 windowId。换窗和分支建立新身份，并记录 previousWindowId；自动及手动 Compaction 都保持当前窗口身份。换窗后的首个请求只包含常规 system/tools 和不超过 512 个估算 token 的 bootstrap：窗口 ID、resume_ref、恢复指令。旧消息后缀、Todo 和 Note 正文不会自动注入。
 
 模型先用 context_note query 解析 resumeRef，再从 history 读取有效任务要求、后续用户约束、Todo 或所需证据。Note 只记录语义变化；默认 query 返回元数据，item 指定 eventId 才读取正文和 freshness。旧成功结果不会自动成为当前状态证明。单次变更和 64 条活跃笔记受限，累计审计事件不设 256 条失效门槛。
 
-new_context({reason}) 仅记录意图。当前 assistant 的整批工具调用和结果完成后，AgentSession 统一处理 model_requested、work_budget_reached、provider_context_rejected。待审批交互和运行中的后台任务会推迟提交。每个来源窗口最多提交一次，每个用户 prompt 最多换窗 8 次；同一请求幂等，实际目标请求必须缩小并满足工作预算。
+首次写入 Note 的最小参数是 `operation`、`kind`、`key`、`text` 和至少一个 `sourceRefs`；`evidenceRefs` 缺省为空，`resume` 可省略。更新或撤回已有 Note 时才传当前 `eventId` 作为 `supersedesEventId`，不得传空字符串。恢复引用只放在 `resume` 内。
+
+new_context({reason}) 持久化模型的换窗意图，是提交新窗的必要条件。容量压力和 provider 容量拒绝只触发渐进维护，合法 Note 本身不授权换窗。当前 assistant 的整批工具调用和结果落盘后才能提交；待审批交互和 active 非 subagent Task 会推迟提交。内置 task 已返回原 ID 且交接校验通过后，子任务仍在 running/cancelling 也可跨窗，继续使用原 TaskManager；换窗不取消或重派任务。每个来源窗口最多提交一次，每个用户 prompt 最多换窗 8 次；同一请求幂等，实际目标请求必须缩小并满足工作预算。
+
+next_action/current 的 resume 必须包含 subagentContinuations 数组，无关联子任务时为空。当前任务 scope 的全部委派、仍 active 的早期子任务和 Note 关联任务，均须填写 taskId、parentRelation 和 onResult。运行时从原委派记录构造目录，分页恢复原调用正文、父任务关系和结果处理步骤，并在首个业务请求前检查正文覆盖。缺少交接返回 subagent_handoff_invalid，正文在最终请求中丢失返回 recovery_request_incomplete。终态或一次查询均不表示结果已处理；进程重启后查不到原 ID 只表示当前 runtime 没有句柄。详细契约见 [子 Agent 跨窗 Spec](specs/subagent-context-rollover.md)。
+
+换窗前先同步 Todo，再保存有效 next_action/current Note。恢复清单从权威 Todo 快照包含全部 pending/in_progress，以及模型显式选择的其他依赖，不受 resume.todoIds 的 8 项上限截断。必需要求、Note 和 Todo 全部进入实际请求后才开放业务工具。Todo 先持久化候选快照，再发布内存状态。
 
 ## 最终请求预算
 
@@ -23,7 +29,9 @@ S = max(4096, ceil(R * 0.2))
 remainingWork = max(0, min(W * 阈值 - I, remainingInput) - 3072)
 ~~~
 
-阈值由 compaction.autoCompactThresholdPercent 配置，默认 85%。工作预算用尽且仍有保存空间时，每个窗口和 promptGeneration 只建立一个持久化 save_state 操作；它最多使用 3 次 sampling、2048 个输出 token 和 3072 个查询/结果控制 token。保存阶段只开放 history、context_note、get_context_remaining 和 new_context，额度与次数从日志恢复，不因重启返还。完成的 continuation contract 在提交前还会对并发到达的用户约束、Todo、工具配置和来源 revision 重新验证。
+阈值由 compaction.autoCompactThresholdPercent 配置，默认 85%。最终请求出现压力时先执行 Shake 并重测，仍不足则语义压缩旧前缀并重测。Compaction 保留生效要求、当前 Note/Todo 和最近完整工具交互；候选请求必须严格变小才能提交。同一业务来源和请求配置只尝试一次 Shake、一次 Compaction，额度在执行前持久化，控制工具与重启不会返还额度。
+
+两级减负后仍有压力且请求可发送时，进入模型决策与保存阶段。每个窗口和 promptGeneration 只建立一个持久化 save_state 操作，最多使用 3 次 sampling、2048 个输出 token 和 3072 个查询/结果控制 token。该阶段开放获准的 history、context_note、todo_write、get_context_remaining 和 new_context。模型可以结束任务或显式请求换窗；没有换窗意图且额度耗尽时停止，不自动切窗。完成的 continuation contract 在提交前还会对并发到达的用户约束、Todo、工具配置和来源 revision 重新验证。
 
 rollover 提交前会用实际 transform、append-only 和完整业务工具定义预检整个恢复工作集。必读 Note、任务要求、History 引用和 Todo 正文无法与正常输出、安全余量及后续保存空间共同容纳时，返回 recovery_workset_too_large 并保留旧窗口。
 
@@ -50,36 +58,31 @@ compaction.enabled=false 关闭自动容量触发，最终容量检查仍然执�
 
 已提交但未 started 的恢复必须重新得到相同请求指纹、预算和队列集合，才能发送一次。started 没有 finished 表示 outcome_unknown，禁止自动重放。完整的无末尾换行 JSONL 条目可继续追加；不完整的最后一条记录阻止自动恢复。此顺序保证针对进程崩溃；未使用 fsync，不承诺断电持久性。
 
-/trace 可检查 context/budget、context/rollover、context/task_note、compaction/summary、memory/archive 和 turn/end。未解决的 context_limit 或 context_transition 表示任务尚未完成；print/JSON 模式返回退出码 1。SDK/RPC 应在 agent_settled 后检查 runState.lastOutcome 和 contextRolloverState，而非把 prompt 接受成功当作完成。
+/trace 可检查 context/budget、context/rollover、context/task_note、compaction/summary、memory/archive 和 turn/end。context_maintenance 将控制交回宿主；未解决的 context_maintenance、context_limit 或 context_transition 表示任务尚未完成。print/JSON 模式对未完成结果返回退出码 1，即使尚未产生助手回复。SDK/RPC 应在 agent_settled 后检查 runState.lastOutcome 和 contextRolloverState，而非把 prompt 接受成功当作完成。
 
-## 记忆安全、快照和归档
+## 长期记忆权威与归档
 
-所有写入入口先执行相同安全规则。拒绝结果包含 `written`、`skipped`、`reasons`，例如 `secret_pattern`、`high_entropy_token`、`empty`；不回显被拒绝的值或其前缀。规则过滤不是“绝对无秘密”的保证。
+长期记忆使用项目目录中的 `memory-state.v2.json` 作为唯一有效性权威。顶层请求在进入运行时前建立稳定 `rootPromptId`；模型重试、Todo 续跑和自动换窗沿用该 ID。原始用户输入、扩展转换、助手输出、完整工具结果及 Task 输出分别登记为带 origin、哈希和完整性状态的证据。旧轮后台 Task 始终写回创建它的 Run。
 
-读取、关键词召回、向量候选、文档 embedding 和正文提炼共享有效视图：解析 Markdown → 撤销检查 → 安全过滤。异步向量查询返回前再次检查候选。撤销 sidecar 损坏会报错，不按空撤销集合处理。构造视图不会重写原文件；撤销也不会物理擦除旧会话里的事实。
+业务执行、证据持久化和归档各有独立状态。Run 只有在主执行静止、续跑关闭、全部 dependency Task 的终态证据可回读且没有 pending evidence 时才封存固定 Manifest。封存建立可恢复 job；自动换窗和 `/compact` 不触发晋升。`memory.enabled` 和 `memory.archive.enabled` 都为 true 时，顶层 Session 才在后台处理归档 job；子代理不独立归档。
 
-`memory.enabled` 控制手动压缩后的会话笔记及 Memory 工具注册，不自动激活工具。手动 `/memory flush` 不压缩当前上下文。自动换窗不生成摘要、不写入跨会话 Memory，也不触发自动提炼。
+提炼与逐候选校验是无业务工具的独立模型调用。模型只能提出结论、范围、引用和关系；宿主校验来源集合、覆盖收据、安全规则、冲突集合版本和项目要求版本。支持检查与全 Manifest 反证检查均通过后才能提交。达到候选上限、缺少完整证据、冲突版本变化或语义校验不可用时不会产生 active 记录。
 
-每份笔记的稳定 ID 来自 `(sessionId, compactionId)`，与日期和会话改名无关。文件首行记录 `id`、`sessionId`、`compactionId`、`contentHash`、`storedHash`；同日多次压缩不会覆盖。相同来源重复写入受锁保护，内容冲突明确拒绝。
+job 通过项目锁、lease、attempt token、提炼检查点和逐候选校验收据恢复。旧 worker 的晚到结果无法写入。每项目小时调用预留持久化；额度不足进入 `waiting_budget`，在 `retryAt` 后继续，不增加技术失败次数。相同 candidateKey 生成稳定 memoryId，最终提交和重复 flush 保持幂等。
 
-MemoryStore 的显式 `maybeConsolidate` 接口使用默认 24 小时间隔和至少 3 个不同未处理 sessionId 的门槛。只选择请求预算能容纳的完整笔记，不截断正文假装已处理。提炼无执行工具，笔记作为不可信数据输入，返回严格结构：
+所有写入入口执行相同的敏感内容过滤。被过滤的证据在归档视图中只保留缺口、哈希和原因，不能计为完整反证覆盖；被拒绝内容不会在状态或 trace 中回显。原 Session 的保存策略与项目归档视图分离。
 
-```json
-{"facts":[{"text":"项目约定","sourceNoteIds":["note-source-id"]}]}
-```
+## 有效读取和手动入口
 
-未知字段、空文本、空来源、非本批来源、无效 JSON 或敏感事实均不提交。`facts: []` 是合法的 `processed_no_facts`，会推进水位但不生成空记忆。
+`memory_search` 和 `memory_get` 都从 v2 authority 计算结果。默认只返回最新 `active`、来源仍可验证且当前 machineConditions 适用的项目记录。`memory_get` 仅接受 memoryId；`includeUnverified` 和 `includeHistory` 只扩大同一项目内可调查的状态，不能绕过来源和适用性检查。规则命中会展开 replacement、exception 和 conflict 关系；例外条件未知时，基础规则不会作为无条件事实返回。
 
-项目排他锁覆盖资格检查、生成和提交。提交前再次验证来源正文和有效视图；稳定批次 ID、提交日志和幂等条目 ID 让“事实已写、水位未写”的重试收敛，不重复追加。锁竞争明确返回未运行；失败、取消或超时不伪报处理成功。
+启用 `memory.enabled` 且使用默认工具集合时，Memory 工具加入默认候选后再经过 allowlist、deny 和能力过滤。显式工具集合不会被扩充。当前用户要求始终高于历史记忆。
 
-只有成功处理的笔记才能进行既有 30/180 天分层老化；老化保留来源身份和已处理水位。压缩成功与记忆归档失败分别记录，后者不回滚有效压缩。
+- `/memory remember <rule>` 原子保存原始用户规则和 active 修订。
+- `/memory flush` 只封存和处理当前已闭合 Run，不压缩或改写上下文；返回 job、Manifest、实际写入数、剩余来源和原因。
+- `/memory status` 显示记录、证据、失败、预算等待、下次调度时间和各 job 状态。
+- `/memory undo <memoryId>` 写入 revoked 修订；搜索和直接读取立即遵守撤销状态。
 
-## 接口和已有数据
+旧 `MEMORY.md`、Session notes、`.dream-state.json`、提交日志和撤销 sidecar 原样保留为历史数据。新归档不读取这些文件作为 active 知识，不运行 autoDream，不覆盖人工 Markdown。显式旧数据导入尚未提供，因此旧条目不会自动获得用户规则或已验证事实身份。
 
-- `writeSessionNote(cwd, slug, sessionId, content, compactionId)` 返回写入结果，调用方必须检查 `written`，不能把返回值当路径字符串。
-- `maybeConsolidate` 的提炼器接收完整 `NoteSnapshot[]` 与 `AbortSignal`，返回经过校验的 `MemoryExtraction`。模型调用方提供整批输入预算判定。
-- `.dream-state.json` 使用 `lastConsolidatedAt` 和 `processed: { [noteId]: contentHash }`；`.dream-commit.json` 是尚待收敛的提交日志。文件写入分别原子替换，不宣称跨文件原子事务。
-- 不提供旧水位格式兼容层，不自动迁移或清理已有文件。旧格式水位会明确拒绝自动归档；无来源元数据的旧/人工笔记仍可通过有效视图读取，但不会冒充成功压缩快照参加自动归档。
-- JSONL 原始消息不被 shake/compaction 改写。新增 trace 是 log-only，不推进逻辑叶子；不能用“文件最后一个 entry”替代“当前分支叶子”。
-
-真实模型语义保留率、事实召回率和幻觉数量需要另行授权的固定数据集评估；本轮 faux 测试不证明这些质量指标。
+JSONL 原始消息不被 shake、compaction 或归档改写。Memory trace 为 log-only，不推进逻辑叶子。真实模型的晋升准确率、召回率、冲突判断和成本仍需要固定人工标注数据集评估；faux provider 回归只验证控制契约。

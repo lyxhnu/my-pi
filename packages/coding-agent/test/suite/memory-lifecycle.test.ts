@@ -137,25 +137,47 @@ describe("memory-context-integrity: effective memory", () => {
 		}
 	});
 	it("M01/M03 rejects manual flush and compaction output with safe result metadata", async () => {
+		const simulatedSecret = "API_KEY=simulated-secret";
 		const h = await createHarness({
 			tools: [],
 			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1 } },
+			memoryArchiveExtractor: {
+				extract: async (sources) => ({
+					checkedSourceIds: sources.map((source) => source.sourceId),
+					uncheckedSourceIds: [],
+					candidates: [
+						{
+							candidateKey: "unsafe",
+							kind: "implementation_fact",
+							subject: "unsafe",
+							text: simulatedSecret,
+							scope: { project: true },
+							sourceIds: [sources[0]!.sourceId],
+						},
+					],
+				}),
+			},
 		});
 		harnesses.push(h);
 		await h.session.prompt("keep project rules");
 		await h.session.prompt("next rule");
-		const simulatedSecret = "API_KEY=simulated-secret";
-		h.setResponses([fauxAssistantMessage(simulatedSecret), fauxAssistantMessage("turn summary")]);
 		const result = await h.session.flushMemoryNow();
-		expect(result).toMatchObject({ attempted: true, written: 0, skipped: 1, reasons: ["secret_pattern"] });
+		expect(result).toMatchObject({
+			attempted: true,
+			status: "deferred",
+			written: 0,
+			reasons: ["unsafe_memory_record"],
+		});
 		expect(JSON.stringify(result)).not.toContain("simulated-secret");
-		h.setResponses([fauxAssistantMessage(simulatedSecret), fauxAssistantMessage("turn summary")]);
+		const archiveBeforeCompaction = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "trace" && entry.event.type === "memory/archive");
+		h.setResponses([fauxAssistantMessage("turn summary")]);
 		await h.session.compact();
 		const archive = h.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "trace" && entry.event.type === "memory/archive");
-		expect(archive).toHaveLength(1);
-		expect(JSON.stringify(archive)).toContain("note_rejected");
+		expect(archive.map((entry) => entry.id)).toEqual(archiveBeforeCompaction.map((entry) => entry.id));
 		expect(JSON.stringify(archive)).not.toContain("simulated-secret");
 		expect(await h.session.memoryStore.search("API_KEY", "project", h.tempDir)).toEqual([]);
 	});

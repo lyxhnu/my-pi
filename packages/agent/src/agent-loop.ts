@@ -270,7 +270,7 @@ export async function runAgentLoopContinue(
 export async function runAgentLoopPrepared(
 	context: AgentContext,
 	injectedItems: QueuedAgentMessage[],
-	preparedRequest: PreparedAgentRequest,
+	preparedRequest: PreparedAgentRequest | undefined,
 	config: AgentLoopConfig,
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
@@ -286,7 +286,7 @@ export async function runAgentLoopPrepared(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 	if (injectedItems.length > 0) {
-		await emit({ type: "queue_delivery", preparationId: preparedRequest.preparationId, items: injectedItems });
+		await emit({ type: "queue_delivery", preparationId: preparedRequest?.preparationId, items: injectedItems });
 	}
 	for (const message of injectedMessages) {
 		await emit({ type: "message_start", message });
@@ -354,11 +354,21 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			preparedRequest ??= await prepareAgentRequest(currentContext, config, signal);
-			const control = config.controlRequest?.(preparedRequest.budget, preparedRequest.requestFingerprint);
-			if (control?.type === "context_transition") {
+			if (!preparedRequest) {
+				preparedRequest = await prepareAgentRequest(currentContext, config, signal, {
+					mode: "dispatch",
+					truncationFloor,
+				});
+				config = { ...config, model: preparedRequest.model, reasoning: preparedRequest.reasoning };
+			}
+			const control = config.controlRequest?.(
+				preparedRequest.budget,
+				preparedRequest.requestFingerprint,
+				preparedRequest.context,
+			);
+			if (control?.type === "context_transition" || control?.type === "context_maintenance") {
 				await emit({ type: "context_budget", budget: preparedRequest.budget });
-				await emit({ type: "agent_end", messages: newMessages, outcome: { type: "context_transition" } });
+				await emit({ type: "agent_end", messages: newMessages, outcome: { type: control.type } });
 				return;
 			}
 			if (control?.type === "failed") {
@@ -585,6 +595,9 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(request.model.provider) : undefined) || config.apiKey;
 	signal?.throwIfAborted();
+	if (request.appendOnlyContext && config.appendOnlyContext) {
+		config.appendOnlyContext.replaceWith(request.appendOnlyContext);
+	}
 
 	const response = await streamFunction(request.model, request.context, {
 		...config,
@@ -666,6 +679,7 @@ export async function prepareAgentRequest(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
+	ordinary?: { mode: "dispatch" | "measure"; truncationFloor?: ThinkingLevel },
 ): Promise<PreparedAgentRequest> {
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -674,7 +688,46 @@ export async function prepareAgentRequest(
 
 	const llmMessages = await config.convertToLlm(messages);
 	const usageContextMessages = config.projectUsageContext?.(llmMessages) ?? llmMessages;
-	const lastMessage = llmMessages[llmMessages.length - 1];
+	const baseRequest = prepareProviderRequest(
+		{ systemPrompt: context.systemPrompt, messages: llmMessages, tools: context.tools },
+		usageContextMessages,
+		config,
+		signal,
+	);
+	if (!ordinary || !config.prepareRequest) return baseRequest;
+	return (
+		(await config.prepareRequest(
+			baseRequest.context,
+			async (update) => {
+				let reasoning =
+					update?.thinkingLevel === undefined
+						? config.reasoning
+						: update.thinkingLevel === "off"
+							? undefined
+							: update.thinkingLevel;
+				if (ordinary.truncationFloor !== undefined)
+					reasoning = lowerThinkingLevel(reasoning, ordinary.truncationFloor);
+				return prepareProviderRequest(
+					update?.context ?? baseRequest.context,
+					baseRequest.usageContextMessages,
+					{ ...config, model: update?.model ?? config.model, reasoning },
+					signal,
+				);
+			},
+			signal,
+			ordinary.mode,
+		)) ?? baseRequest
+	);
+}
+
+/** Measure an already converted candidate without re-entering host transformations. */
+function prepareProviderRequest(
+	context: Context,
+	usageContextMessages: readonly Message[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): PreparedAgentRequest {
+	const lastMessage = context.messages[context.messages.length - 1];
 	if (!lastMessage) {
 		throw new Error("Cannot prepare continuation: final provider context has no messages");
 	}
@@ -683,16 +736,13 @@ export async function prepareAgentRequest(
 	}
 
 	const preparedAppendOnlyContext = config.appendOnlyContext?.fork();
+	preparedAppendOnlyContext?.noteModel(config.model.provider, config.model.id);
 	let llmContext: Context;
 	if (preparedAppendOnlyContext) {
-		preparedAppendOnlyContext.syncMessages(llmMessages);
+		preparedAppendOnlyContext.syncMessages(context.messages);
 		llmContext = preparedAppendOnlyContext.build(context);
 	} else {
-		llmContext = {
-			systemPrompt: context.systemPrompt,
-			messages: llmMessages,
-			tools: context.tools,
-		};
+		llmContext = context;
 	}
 
 	llmContext = detachRequestContext(llmContext);
@@ -709,7 +759,7 @@ export async function prepareAgentRequest(
 		reasoning: config.reasoning,
 		usageContextMessages: detachRequestContext({
 			systemPrompt: context.systemPrompt,
-			messages: usageContextMessages,
+			messages: [...usageContextMessages],
 			tools: context.tools,
 		}).messages,
 		requestFingerprint: createProviderRequestFingerprint(llmContext, config.model, {

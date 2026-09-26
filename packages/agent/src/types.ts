@@ -16,6 +16,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
+import type { PreparedAgentRequest } from "./agent-loop.ts";
 import type { AppendOnlyContextManager } from "./append-only-context.ts";
 
 /**
@@ -179,14 +180,33 @@ export type AgentLoopAfterTurnControl =
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
+/** Candidate changes after the request's agent messages have been converted exactly once. */
+export type AgentRequestUpdate = Pick<AgentLoopTurnUpdate, "model" | "thinkingLevel"> & { context?: Context };
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/**
+	 * Prepare an ordinary request after queue delivery, inside the active abort lifecycle.
+	 * Context has already been transformed and converted once. The supplied prepare function
+	 * only measures detached provider candidates; it never repeats those transformations.
+	 * Return the validated snapshot to dispatch exactly that request. In measure mode, compose
+	 * the same runtime context without committing configuration changes or consuming state.
+	 * Not called by prepared-continuation dispatch or save-state preparation.
+	 */
+	prepareRequest?: (
+		context: Context,
+		prepare: (update?: AgentRequestUpdate) => Promise<PreparedAgentRequest>,
+		signal?: AbortSignal,
+		mode?: "dispatch" | "measure",
+	) => Promise<PreparedAgentRequest | undefined>;
 	getContextBudgetOptions?: (model: Model<Api>) => ContextBudgetOptions;
 	/** Final-request control, after all transformations and budget measurement. */
 	controlRequest?: (
 		budget: ContextBudget,
 		requestFingerprint: string,
+		context: Context,
 	) =>
+		| { type: "context_maintenance" }
 		| { type: "context_transition" }
 		| { type: "failed"; message: string }
 		| {
@@ -411,6 +431,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 /** Why the most recently settled agent run ended. */
 export type AgentRunOutcome =
 	| { type: "completed" }
+	| { type: "context_maintenance" }
 	| { type: "context_transition" }
 	| { type: "context_limit"; budget: ContextBudget }
 	| { type: "failed"; message: string }

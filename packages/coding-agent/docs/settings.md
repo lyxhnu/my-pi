@@ -47,6 +47,19 @@ Use `/trust` in interactive mode to save a project trust decision for future ses
 }
 ```
 
+### Agent-owned execution upgrades
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `executionUpgrade.enabled` | boolean | `false` | Expose `upgrade_execution` and runtime observations to main and child agents |
+| `executionUpgrade.modelOrder` | string[] | `[]` | Exact `provider/model` IDs in user-declared weakest-to-strongest order |
+| `executionUpgrade.reminderRounds` | number | `8` | Business rounds since the last observation reset before suggesting a review |
+| `executionUpgrade.reminderToolCalls` | number | `24` | Tool attempts since the last observation reset before suggesting a review |
+| `executionUpgrade.reminderRepeatedErrors` | number | `3` | Matching tool, arguments, and error results within the observation interval |
+| `executionUpgrade.reminderCooldownRounds` | number | `4` | Minimum business rounds between review reminders |
+
+Thresholds only produce a reminder; they never select a model. The executing agent must explicitly call `upgrade_execution`. With an empty model order, only higher supported thinking levels on the current model are available. See [Execution upgrades](execution-upgrades.md) for configuration, lifecycle, and trace inspection.
+
 ### UI & Display
 
 | Setting | Type | Default | Description |
@@ -117,9 +130,18 @@ Risky built-in process, network, and external-system effects ask for confirmatio
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `memory.enabled` | boolean | `false` | Register the `memory_search` and `memory_get` tools |
+| `memory.enabled` | boolean | `false` | Enable project memory authority and add `memory_search`/`memory_get` to the default tool set |
 | `memory.scopeDefault` | string | `"project"` | Default search scope: `"global"`, `"project"`, or `"all"` |
 | `memory.globalAutoWrite` | boolean | `false` | Permit automatic global-memory writes |
+| `memory.archive.enabled` | boolean | `false` | Archive closed top-level evidence runs in the background |
+| `memory.archive.maxConcurrencyPerProject` | number | `1` | Maximum concurrently leased archive jobs for one project |
+| `memory.archive.maxFailuresPerWorkItem` | number | `3` | Technical failures allowed for one extraction or validation work item |
+| `memory.archive.modelCallTimeoutMs` | number | `60000` | Timeout for each archive model call |
+| `memory.archive.maxInputTokensPerCall` | number | `16000` | Maximum archive input budget per model call |
+| `memory.archive.maxOutputTokensPerCall` | number | `2000` | Maximum archive output budget per model call |
+| `memory.archive.maxModelCallsPerSlice` | number | `4` | Model calls before a persisted scheduling yield |
+| `memory.archive.maxCandidatesPerBatch` | number | `12` | Candidate ceiling; reaching it stops the job for review |
+| `memory.archive.maxModelCallsPerProjectHour` | number | `24` | Persistent rolling hourly reservation limit per project |
 | `reminder.enabled` | boolean | `true` | Master switch for todo nudge and gate behavior |
 | `reminder.todoNudge.enabled` | boolean | `true` | Inject periodic todo reminders when `todo_write` is active |
 | `reminder.todoNudge.turnsSinceTodoWrite` | number | `3` | Turns without `todo_write` before nudging |
@@ -145,9 +167,9 @@ Risky built-in process, network, and external-system effects ask for confirmatio
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `compaction.enabled` | boolean | `true` | Enable automatic context-window transitions |
-| `compaction.reserveTokens` | number | `16384` | Manual-summary output budget |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained by manual compaction |
+| `compaction.enabled` | boolean | `true` | Enable automatic Shake, Compaction, and model window decisions |
+| `compaction.reserveTokens` | number | `16384` | Compaction-summary output budget |
+| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained by compaction |
 | `compaction.autoCompactThresholdPercent` | number | `85` | Work-budget ceiling before the state-saving reserve |
 
 ```json

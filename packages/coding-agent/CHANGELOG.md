@@ -4,23 +4,26 @@
 
 ### Breaking Changes
 
+- Require `resume.subagentContinuations` on `next_action/current` and persist branch-verifiable subagent references with rollover recovery contracts.
 - Removed `history_get`, automatic-compaction policy/checkpoint exports, and `compactModel`, `strictCompactModel`, `twoPassEnabled`, `wallClockBudgetSecs`, and `memoryFlushEnabled` settings. Use `history` and the window tools; handle `context_transition` as incomplete.
 - Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history`, `context_note`, `get_context_remaining`, and `new_context`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
 - Replaced unreachable background task states with an explicit `running`/`cancelling`/terminal state machine; `TaskManager.wait()` now reports its own deadline separately from task status.
-- Changed memory notes to require a committed compaction ID and return write/rejection results. Automatic consolidation uses source-identified snapshots and a processed-ID/hash state instead of filename watermarks; old state files are not silently migrated. `memory_get` now returns the effective, non-revoked safe view, not raw Markdown.
+- Replaced Markdown-backed active memory and compaction-triggered consolidation with project-scoped v2 authority records. `memory_get` now accepts a memory ID, and RPC/TUI memory operations use remember/status/flush/undo against revisioned records. Existing Markdown and dream-state files remain historical data and are not auto-imported.
 - Added `runState` to RPC `get_state` and `reasons` to memory-flush results. Consumers must handle `context_limit` as non-completion.
+- Compaction now preserves window identity; only explicit model `new_context` intent authorizes hard rollover. Consumers must also handle `context_maintenance` as incomplete.
 
 ### Added
 
+- Added opt-in agent-owned execution upgrades, factual progress observations, review reminders, independent child upgrades, atomic profile persistence, and RPC/trace diagnostics.
 - Added stable context-window identities, bounded state saving, minimal recovery references, prepared dispatch, durable queue receipts, and crash recovery without replaying unknown outcomes.
 - Added branch-scoped Task Note updates and bounded queries with evidence freshness; cumulative audit events no longer invalidate the active projection.
 - Added `history` for bounded window/item enumeration, saved-text reads, and literal search using one visibility policy.
-- Added source-linked Memory extraction, stable note identities and journaled idempotent archive commits.
+- Added stable prompt runs, log-only evidence events, fixed source manifests, leased archive jobs, persistent model-call budgets, extraction/validation checkpoints, conflict-version revalidation, and idempotent memory commits.
 - Added budget, window/dispatch, manual-summary and memory-archive trace diagnostics, including persistence/export for requests stopped before the first assistant response.
 - Added effect-based tool permission decisions and interactive/RPC approval for risky built-in process, network, and external-system effects.
 - Added built-in Tavily web search via `TAVILY_API_KEY`; `web_search` is registered only when a backend is configured, and SDK callers can inject `WebSearchOperations`.
 - Added `/shake`, which frees context by dropping large tool results and fenced/XML blocks without a model call.
-- Added automatic deterministic shake of eligible tool output before final request checks.
+- Added progressive capacity maintenance using final transformed request budgets: deterministic Shake, same-window Compaction, then bounded model window decisions with persistent attempt accounting.
 - Added the `shake` session entry type, persisting redactions so a reduction survives a session reload, and `context.appendOnly` (default `false`) to enable the agent's append-only context mode.
 - Added an optional vector recall channel to `memory_search`: configure `memory.embedding.{baseUrl,model,apiKeyEnv}` (OpenAI-compatible `/embeddings` endpoint, key read from the named env var) and semantic hits are fused with keyword scores; unconfigured setups keep the exact keyword-only behavior. Vectors are cached in `.memory-index.json` sidecars and refreshed lazily per search.
 - Added three-tier age degradation for session notes, exposed through the Memory store: notes older than 30 days are truncated to 800 chars, older than 180 days reduced to heading/list key signal (300 chars), with search downweighting tiers at 1/0.85/0.7. Curated MEMORY.md is never degraded.
@@ -29,13 +32,18 @@
 
 ### Changed
 
-- Changed `memory_search` ranking: term scores now decay with age (floored at 70%, half-life 90 days for curated MEMORY.md blocks and 14 days for session notes) and the top candidates are MMR-reranked so near-duplicate entries don't crowd out complementary ones.
-- Replaced automatic soft compaction, checkpoints, handoff bundles and progress credits with window transitions and on-demand retrieval. Manual `/compact` remains independent.
+- Changed `memory_search` to rank current authority records and expand their replacement, exception, and conflict relations after applying the same status, source, and applicability checks used by direct reads.
+- Unified automatic and manual compaction around shared summarization, preserving active requirements and the Note/Todo workset. Compaction does not write or promote Memory notes.
 
 ### Fixed
 
+- Allow delegated subagents to remain running or cancelling across context rollover while preserving tool-batch, budget and provenance checks. Restore delegation instructions and parent result-handling plans before business requests, and keep print/json sessions alive through continuation.
+- Include task IDs in model-visible foreground subagent results so completed and blocked delegations can be referenced in continuation notes.
+- Fixed real-model memory extraction schema drift, assistant-source coverage gaps, stale archive failure status, scoped-rule false negatives, short RPC command timeouts, and first-write `context_note` schema friction found by restart-level Agent testing.
 - Fixed split-turn summary inheritance, invalid-summary commits, stale usage anchors, revoked vector/read results, and secret-filter bypasses through note/archive inputs.
 - Fixed context-limit handling across CLI, RPC and subagents; reduction is bounded, rechecks the actual request, and does not replay tools or duplicate queued user messages.
+- Fixed rollover recovery to include all unfinished Todo even when omitted from model-selected dependencies, and persist Todo updates before publishing them in memory. CLI failures before the first assistant response now return a nonzero exit code.
+- Fixed `context_note` to accept History's whole-text references, including Todo snapshots, and clarified bounded saving and recovery prompts after real-model testing.
 - Restricted lossy note aging to successfully processed snapshots and preserved their processed identity across aging.
 - Fixed Windows path containment and memory path construction, bounded UTF-8 task/tool output, transactional subagent worktree application, deterministic LSP/MCP shutdown, and the reminder master switch.
 - Fixed compaction and branch summaries for providers whose authentication resolves entirely to request headers ([#5871](https://github.com/earendil-works/pi/issues/5871))

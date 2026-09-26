@@ -447,6 +447,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				const contextRollover = session.contextRolloverState;
 				const taskNotes = session.taskNoteState;
 				const state: RpcSessionState = {
+					executionUpgrade: session.getExecutionUpgradeState(),
 					runState:
 						runState.status === "idle"
 							? runState
@@ -560,20 +561,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			// =================================================================
-			// Memory (spec 10.5/10.6: manual /memory flush + /memory undo)
+			// Project memory authority
 			// =================================================================
 
+			case "memory_remember": {
+				const result = session.rememberMemoryRule(command.text);
+				return success(id, "memory_remember", result);
+			}
+
 			case "memory_flush": {
-				const result = await session.flushMemoryNow(command.customInstructions);
+				const result = await session.flushMemoryNow();
 				return success(id, "memory_flush", result);
 			}
 
+			case "memory_status": {
+				return success(id, "memory_status", session.getMemoryStatus());
+			}
+
 			case "memory_undo": {
-				const undone = session.memoryStore.undo(
-					command.scope,
-					command.scope === "project" ? session.sessionManager.getCwd() : undefined,
-					command.entryId,
-				);
+				const undone = session.revokeMemory(command.memoryId);
 				return success(id, "memory_undo", { undone });
 			}
 

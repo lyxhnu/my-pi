@@ -6,9 +6,12 @@
 
 - Replaced the independent `AgentState.isStreaming`, `streamingMessage`, `pendingToolCalls`, and `errorMessage` fields with the explicit discriminated `AgentState.runState` lifecycle.
 - Replaced raw steering/follow-up queue messages with stable `QueuedAgentMessage` values and routed `Agent.continue()` through the new prepare/dispatch continuation contract.
+- Added the incomplete `context_maintenance` outcome for returning final-request capacity pressure to the host after complete tool batches.
 
 ### Added
 
+- Pass the final provider context to `controlRequest` so hosts can verify required recovery content after request transforms and before dispatch.
+- Added ordinary-request preparation inside the active abort lifecycle, after queue delivery, with explicit dispatch/measurement modes and reuse of the validated request. Measurements include preparation hooks without committing execution upgrades.
 - Added final-request control hooks, a single restricted state-saving turn, and `context_transition` outcomes after complete tool batches.
 - Added immutable `PreparedContinuation` handles that reserve queued deliveries and guarantee preview/dispatch reuse of the same transformed provider request.
 - Added final-request `context_budget` events and structured `context_limit` outcomes without synthetic assistant messages; checks run after transforms, conversion and append-only assembly.

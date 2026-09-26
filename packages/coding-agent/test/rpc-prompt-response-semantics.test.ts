@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,7 @@ import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import { SettingsManager } from "../src/core/settings-manager.ts";
+import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
@@ -95,7 +96,12 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
+async function createRuntimeHost(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	settings?: Partial<Settings>;
+}): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
@@ -128,6 +134,7 @@ async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: 
 
 	const sessionManager = SessionManager.inMemory(tempDir);
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
+	settingsManager.applyOverrides(options.settings ?? {});
 	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 	const modelRegistry = await createModelRegistry(authStorage, tempDir);
 	if (options.withAuth) {
@@ -171,7 +178,12 @@ async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: 
 	};
 }
 
-async function startRpcMode(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
+async function startRpcMode(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	settings?: Partial<Settings>;
+}): Promise<{
 	lineHandler: (line: string) => void;
 	runHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
@@ -218,20 +230,40 @@ describe("RPC prompt response semantics", () => {
 			await cleanup();
 		}
 	});
-	it("E05/M03 returns flush rejections and applies undo through the same memory store", async () => {
-		const { lineHandler, runHost, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+	it("reports unsafe archive failures without leaking candidate text and revokes through the authority", async () => {
+		const { lineHandler, runHost, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			settings: { memory: { enabled: true } },
+		});
 		try {
 			const session = runHost.session;
-			session.sessionManager.appendMessage({ role: "user", content: "remember project decisions", timestamp: 1 });
-			session.sessionManager.appendMessage(createAssistantMessage("pending"));
-			session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
-			session.agent.streamFunction = () => {
+			await session.prompt("remember project decisions");
+			session.agent.streamFunction = (_model, context) => {
 				const stream = new MockAssistantStream();
+				const sourceIds = (JSON.parse(context.messages[0]!.content as string) as Array<{ sourceId: string }>).map(
+					(source) => source.sourceId,
+				);
 				queueMicrotask(() =>
 					stream.push({
 						type: "done",
 						reason: "stop",
-						message: createAssistantMessage("API_KEY=simulated-rpc-secret"),
+						message: createAssistantMessage(
+							JSON.stringify({
+								checkedSourceIds: sourceIds,
+								uncheckedSourceIds: [],
+								candidates: [
+									{
+										candidateKey: "unsafe-rpc-candidate",
+										kind: "user_rule",
+										subject: "unsafe",
+										text: "API_KEY=simulated-rpc-secret",
+										scope: { project: true },
+										sourceIds: [sourceIds[0]],
+									},
+								],
+							}),
+						),
 					}),
 				);
 				return stream;
@@ -245,22 +277,28 @@ describe("RPC prompt response semantics", () => {
 						data: expect.objectContaining({
 							attempted: true,
 							written: 0,
-							skipped: 1,
-							reasons: ["secret_pattern"],
+							status: "deferred",
+							reasons: ["unsafe_memory_record"],
 						}),
 					}),
 				),
 			);
 			expect(rpcIo.outputLines.join("")).not.toContain("simulated-rpc-secret");
-			const cwd = session.sessionManager.getCwd();
-			const { ids } = session.memoryStore.appendProject(cwd, ["obsolete test convention"]);
-			lineHandler(JSON.stringify({ id: "undo", type: "memory_undo", scope: "project", entryId: ids[0] }));
+			const text = "obsolete test convention";
+			const record = session.memoryAuthority.rememberUserRule({
+				rootPromptId: "rpc-obsolete-run",
+				sessionId: session.sessionId,
+				sourceId: "rpc-obsolete-source",
+				text,
+				contentHash: createHash("sha256").update(text).digest("hex"),
+			});
+			lineHandler(JSON.stringify({ id: "undo", type: "memory_undo", memoryId: record.memoryId }));
 			await vi.waitFor(() =>
 				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual(
 					expect.objectContaining({ id: "undo", success: true, data: { undone: true } }),
 				),
 			);
-			expect(await session.memoryStore.search("obsolete", "project", cwd)).toEqual([]);
+			expect(session.memoryAuthority.search("obsolete", {})).toEqual([]);
 		} finally {
 			await cleanup();
 		}
@@ -406,13 +444,13 @@ describe("RPC prompt response semantics", () => {
 	});
 });
 
-describe("RPC memory_flush / memory_undo (spec 10.5/10.6)", () => {
+describe("RPC memory authority commands", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
 	});
 
-	it("memory_flush responds with attempted:false (not an error) when there is nothing to summarize yet", async () => {
+	it("memory_flush reports disabled without treating it as an RPC failure", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: false, responseDelayMs: 0 });
 		try {
 			lineHandler(JSON.stringify({ id: "mf1", type: "memory_flush" }));
@@ -435,15 +473,19 @@ describe("RPC memory_flush / memory_undo (spec 10.5/10.6)", () => {
 		}
 	});
 
-	it("memory_undo tombstones a previously written project memory entry, reachable end-to-end through the RPC protocol", async () => {
+	it("memory_undo revokes an authority record by memoryId", async () => {
 		const { lineHandler, runHost, cleanup } = await startRpcMode({ withAuth: false, responseDelayMs: 0 });
 		try {
-			const cwd = runHost.session.sessionManager.getCwd();
-			const appended = runHost.session.memoryStore.appendProject(cwd, ["Always run tests before committing."]);
-			expect(appended.written).toBe(1);
-			const entryId = appended.ids[0]!;
+			const text = "Always run tests before committing.";
+			const record = runHost.session.memoryAuthority.rememberUserRule({
+				rootPromptId: "rpc-rule-run",
+				sessionId: runHost.session.sessionId,
+				sourceId: "rpc-rule-source",
+				text,
+				contentHash: createHash("sha256").update(text).digest("hex"),
+			});
 
-			lineHandler(JSON.stringify({ id: "mu1", type: "memory_undo", scope: "project", entryId }));
+			lineHandler(JSON.stringify({ id: "mu1", type: "memory_undo", memoryId: record.memoryId }));
 
 			await vi.waitFor(() => {
 				const responses = parseOutputLines(rpcIo.outputLines).filter(
@@ -453,7 +495,7 @@ describe("RPC memory_flush / memory_undo (spec 10.5/10.6)", () => {
 				expect(responses[0]).toMatchObject({ success: true, data: { undone: true } });
 			});
 
-			expect(await runHost.session.memoryStore.search("run tests", "project", cwd, 10)).toHaveLength(0);
+			expect(runHost.session.memoryAuthority.search("run tests", {})).toHaveLength(0);
 		} finally {
 			await cleanup();
 		}
@@ -462,7 +504,7 @@ describe("RPC memory_flush / memory_undo (spec 10.5/10.6)", () => {
 	it("memory_undo responds with undone:false for an unknown id, never throwing", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: false, responseDelayMs: 0 });
 		try {
-			lineHandler(JSON.stringify({ id: "mu2", type: "memory_undo", scope: "global", entryId: "mem-doesnotexist" }));
+			lineHandler(JSON.stringify({ id: "mu2", type: "memory_undo", memoryId: "mem-doesnotexist" }));
 
 			await vi.waitFor(() => {
 				const responses = parseOutputLines(rpcIo.outputLines).filter(

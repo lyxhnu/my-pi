@@ -4,10 +4,21 @@
  * with word-set Jaccard as the similarity — cheap, deterministic, and needs no embeddings.
  */
 
-/** Jaccard similarity over lowercased whitespace-tokenized word sets. Empty sides score 0. */
+const WORD_SEGMENTER = new Intl.Segmenter("zh-CN", { granularity: "word" });
+
+/** Splits normalized Chinese, English, and mixed text into word-like tokens. */
+function tokenize(text: string): Set<string> {
+	const tokens = new Set<string>();
+	for (const part of WORD_SEGMENTER.segment(text.normalize("NFKC").toLowerCase())) {
+		if (part.isWordLike) tokens.add(part.segment);
+	}
+	return tokens;
+}
+
+/** Jaccard similarity over normalized word sets. Empty sides score 0. */
 export function jaccardSimilarity(textA: string, textB: string): number {
-	const wordsA = new Set(textA.toLowerCase().split(/\s+/).filter(Boolean));
-	const wordsB = new Set(textB.toLowerCase().split(/\s+/).filter(Boolean));
+	const wordsA = tokenize(textA);
+	const wordsB = tokenize(textB);
 	if (wordsA.size === 0 || wordsB.size === 0) return 0;
 	let intersection = 0;
 	for (const word of wordsA) {

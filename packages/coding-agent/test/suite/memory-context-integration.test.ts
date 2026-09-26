@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
@@ -81,7 +81,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		},
 	);
 
-	it("C04/D02 manual compaction creates one committed snapshot and does not repeat without new input", async () => {
+	it("C04 manual compaction commits once and does not create archive evidence", async () => {
 		const h = await createHarness({
 			tools: [],
 			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1 } },
@@ -105,11 +105,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		await expect(h.session.compact()).rejects.toThrow("Already compacted");
 		expect(h.faux.state.callCount).toBe(before);
 		expect(h.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		expect(
-			readdirSync(projectSessionsDir(h.session.memoryStore.rootDir, h.tempDir)).filter((name) =>
-				name.endsWith(".md"),
-			),
-		).toHaveLength(1);
+		expect(existsSync(projectSessionsDir(h.session.memoryStore.rootDir, h.tempDir))).toBe(false);
 	});
 	it("C05/E04 rolls back a failed compaction entry write without replacing context or writing notes", async () => {
 		const h = await createHarness({
@@ -221,7 +217,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		expect(h.session.state.runState).toMatchObject({ lastOutcome: { type: "aborted" } });
 	});
 
-	it("D13/E04 reports successful compaction separately when archive persistence fails", async () => {
+	it("D13 keeps compaction independent from archive persistence", async () => {
 		const h = await createHarness({
 			tools: [],
 			settings: { memory: { enabled: true }, compaction: { keepRecentTokens: 1 } },
@@ -240,9 +236,6 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		harnesses.push(h);
 		await h.session.prompt("first");
 		await h.session.prompt("second");
-		vi.spyOn(h.session.memoryStore, "writeSessionNote").mockImplementation(() => {
-			throw new Error("simulated archive failure");
-		});
 		await h.session.compact();
 		expect(h.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			aborted: false,
@@ -250,14 +243,7 @@ describe("memory-context-integrity: cross-module boundaries", () => {
 		});
 		expect(h.session.messages[1].role).toBe("compactionSummary");
 		expect(
-			h.sessionManager
-				.getEntries()
-				.some(
-					(entry) =>
-						entry.type === "trace" &&
-						entry.event.type === "memory/archive" &&
-						entry.event.data.reason === "note_write_failed",
-				),
-		).toBe(true);
+			h.sessionManager.getEntries().some((entry) => entry.type === "trace" && entry.event.type === "memory/archive"),
+		).toBe(false);
 	});
 });

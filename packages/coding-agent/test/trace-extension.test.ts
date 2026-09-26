@@ -78,7 +78,7 @@ describe("trace extension", () => {
 		expect(buildRows(turns[0]!).map((row) => row.label)).toEqual(
 			expect.arrayContaining([
 				expect.stringContaining('user/message "inspect trace"'),
-				expect.stringContaining("request/header test/model · 0 messages · 0 tools"),
+				expect.stringContaining("request/header test/model · thinking off · 0 messages · 0 tools"),
 				expect.stringContaining("step/end #0 · stop · 50ms"),
 			]),
 		);

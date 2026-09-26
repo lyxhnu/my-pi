@@ -10,11 +10,14 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	type BuiltinSubagentType,
 	DEFAULT_CAPABILITY_MODE_BY_TYPE,
 	type SubagentCapabilityMode,
 } from "../../builtin-agents/index.ts";
+import type { ExecutionUpgradeConfig } from "../execution-upgrade.ts";
 import type { TaskManager } from "../tasks/task-manager.ts";
 import type { TaskSnapshot } from "../tasks/types.ts";
 import {
@@ -32,6 +35,8 @@ export const MAX_SUBAGENT_DEPTH = 1;
 export type SubagentIsolation = "none" | "worktree";
 
 export interface SubagentChildRequest {
+	taskId: string;
+	execution?: { model: Model<Api>; thinkingLevel: ThinkingLevel; upgrade: ExecutionUpgradeConfig };
 	agentType: BuiltinSubagentType;
 	capabilityMode: SubagentCapabilityMode;
 	cwd: string;
@@ -69,11 +74,14 @@ export interface SubagentSpawnHandle {
 }
 
 export interface SubagentCoordinatorOptions {
+	captureExecution?: () => NonNullable<SubagentChildRequest["execution"]>;
 	/** Depth of the *current* session (0 for the root session, since children are depth+1). */
 	depth: number;
 	cwd: string;
 	ownerSessionId?: string;
 	rootPromptId?: string;
+	/** Resolve the receiving top-level run when each task is spawned. */
+	getRootPromptId?: () => string | undefined;
 }
 
 const MAX_PATCH_BYTES = 100 * 1024 * 1024;
@@ -165,16 +173,21 @@ export class SubagentCoordinator {
 
 		const { cwd, applyChanges, cleanup } = resolveIsolatedCwd(this.options.cwd, isolation);
 		const runChild = this.runChild;
+		const execution = this.options.captureExecution?.();
 
 		const snapshot = this.taskManager.start({
 			kind: "subagent",
 			ownerSessionId: this.options.ownerSessionId,
-			rootPromptId: this.options.rootPromptId,
+			rootPromptId: this.options.getRootPromptId?.() ?? this.options.rootPromptId,
+			archiveRole: "dependency",
 			cwd,
 			description: request.description,
 			run: async (ctx) => {
 				try {
-					const result = await runChild({ agentType: request.agentType, capabilityMode, cwd, prompt }, ctx.signal);
+					const result = await runChild(
+						{ taskId: ctx.taskId, execution, agentType: request.agentType, capabilityMode, cwd, prompt },
+						ctx.signal,
+					);
 					if ("errorMessage" in result) throw new Error(result.errorMessage);
 					const taskResult: SubagentTaskResult = {
 						agentType: request.agentType,
@@ -206,6 +219,7 @@ export class SubagentCoordinator {
 			snapshot ?? {
 				taskId,
 				kind: "subagent",
+				archiveRole: "dependency",
 				description: "",
 				status: "failed",
 				startedAt: new Date().toISOString(),

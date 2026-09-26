@@ -3,6 +3,7 @@ import { currentContextRecoveryReferences, fingerprintContextRolloverValue } fro
 import { currentContextWindow } from "./context-window.ts";
 import { contextReadFragments } from "./history.ts";
 import type { SessionManager } from "./session-manager.ts";
+import { subagentRecoveryRecords } from "./subagent-continuation.ts";
 import {
 	buildTaskNoteProjectionFromBranch,
 	createTaskNoteFreshnessResolver,
@@ -79,6 +80,7 @@ export function queryTaskNotes(
 		const recovery = currentContextRecoveryReferences(manager, rollover.recovery);
 		const nextAction = projection.snapshot.items.find((item) => item.eventId === recovery.nextActionEventId);
 		if (!nextAction) throw new Error("recovery_reference_invalid");
+		records.push(...subagentRecoveryRecords(manager, recovery, nextAction));
 		records.push({
 			type: "requirements",
 			entryId: recovery.taskSourceEntryId,
@@ -147,7 +149,22 @@ export function queryTaskNotes(
 		records.push(
 			input.item === undefined
 				? { type: "note", eventId: item.eventId, kind: item.kind, key: item.key, freshness: item.freshness }
-				: { type: "note", ...item },
+				: {
+						type: "note",
+						...item,
+						...(item.resume
+							? {
+									resume: {
+										relatedNotes: item.resume.relatedNotes,
+										requiredHistoryRefs: item.resume.requiredHistoryRefs,
+										requirementSourceRefs: item.resume.requirementSourceRefs,
+										todoIds: item.resume.todoIds,
+									},
+									subagentContinuations:
+										"Resolve resumeRef and read every subagent_task page for delegation and continuation bodies.",
+								}
+							: {}),
+					},
 		);
 	}
 	if (input.item !== undefined && records.length === 0) throw new Error("Note item is no longer active");
@@ -171,7 +188,12 @@ export function queryTaskNotes(
 		if (typeof record.text === "string") {
 			const text = record.text;
 			for (const fragment of fragments
-				.filter((fragment) => fragment.eventId === record.eventId)
+				.filter(
+					(fragment) =>
+						fragment.type === record.type &&
+						fragment.eventId === record.eventId &&
+						fragment.taskId === record.taskId,
+				)
 				.sort((a, b) => Number(a.offset) - Number(b.offset))) {
 				if (
 					typeof fragment.offset === "number" &&

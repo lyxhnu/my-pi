@@ -80,6 +80,7 @@ export interface HarnessOptions {
 	subagentDepth?: number;
 	/** Override the Grok-aligned memory root (default: a tmpdir under this harness's tempDir, never the real ~/.pi). */
 	memoryRootDir?: string;
+	memoryArchiveExtractor?: ConstructorParameters<typeof AgentSession>[0]["memoryArchiveExtractor"];
 	/** Override the lsp tool's language server configs (default: DEFAULT_LSP_SERVERS). Tests point this at a fake fixture server. */
 	lspServers?: ConstructorParameters<typeof AgentSession>[0]["lspServers"];
 	/** MCP server configs (default: none, so search_tool/use_tool are not registered). Tests point this at a fake fixture server. */
@@ -215,6 +216,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 		subagentDepth: options.subagentDepth,
 		memoryRootDir: options.memoryRootDir ?? join(tempDir, "memory"),
+		memoryArchiveExtractor: options.memoryArchiveExtractor,
 		lspServers: options.lspServers,
 		mcpServers: options.mcpServers,
 		webSearchOperations: options.webSearchOperations,

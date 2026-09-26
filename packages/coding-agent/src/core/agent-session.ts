@@ -13,7 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import type {
@@ -23,6 +23,7 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	PreparedAgentRequest,
 	PrepareNextTurnContext,
 	ShakeConfig,
 	ThinkingLevel,
@@ -81,10 +82,11 @@ import {
 	STATE_SAVE_CONTROL_TOKENS,
 	STATE_SAVE_OUTPUT_TOKENS,
 } from "./context-budget.ts";
+import { CONTEXT_CONTROL_TOOLS, ContextMaintenance } from "./context-maintenance.ts";
 import {
+	type ContextControlCause,
 	type ContextRecoveryReferences,
 	ContextRollover,
-	type ContextTransitionCause,
 	type ContinuationStateValidation,
 	collectCompleteToolTransactions,
 	contextRecoveryCoverage,
@@ -100,6 +102,14 @@ import {
 } from "./context-rollover.ts";
 import { formatContextWindow } from "./context-window.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { ExecutionMonitor } from "./execution-monitor.ts";
+import {
+	type ExecutionProfile,
+	type ExecutionUpgradeConfig,
+	type ExecutionUpgradeOutcome,
+	type ExecutionUpgradeRequest,
+	executionUpgradeOptions,
+} from "./execution-upgrade.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -129,11 +139,16 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { History } from "./history.ts";
 import { PendingInteractionRegistry } from "./interactions/pending-interactions.ts";
 import { LspManager, type LspServerConfig } from "./lsp/lsp-manager.ts";
 import { McpManager, type McpServerConfig } from "./mcp/mcp-manager.ts";
+import { extractArchivedMemory, validateArchivedMemoryCandidate } from "./memory/archive-extraction.ts";
+import { type MemoryArchiveExtractor, MemoryArchiveService } from "./memory/archive-service.ts";
 import { createOpenAiCompatibleEmbedder, resolveEmbeddingConfig } from "./memory/embeddings.ts";
+import { MemoryAuthority } from "./memory/memory-authority.ts";
 import { MemoryStore } from "./memory/memory-store.ts";
+import type { MemoryArchiveStatus, MemoryEvidenceInput, MemoryRun } from "./memory/types.ts";
 import { type BashExecutionMessage, type CustomMessage, createCustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -160,6 +175,7 @@ import type {
 	SessionManager,
 } from "./session-manager.ts";
 import {
+	buildSessionContext,
 	CURRENT_SESSION_VERSION,
 	collectShakenIndex,
 	getLatestCompactionEntry,
@@ -170,6 +186,7 @@ import {
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
+import { type ContextTransitionGate, captureSubagentHandoff } from "./subagent-continuation.ts";
 import { runPiChildAgent } from "./subagents/pi-child-runner.ts";
 import {
 	MAX_SUBAGENT_DEPTH,
@@ -180,10 +197,12 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import {
 	buildTaskNoteProjectionFromBranch,
 	createTaskNoteFreshnessResolver,
+	createTaskScopeId,
 	fingerprintTaskNoteWorkspaceContent,
 	resolveTaskNoteScope,
 } from "./task-note-projection.ts";
 import { TaskManager } from "./tasks/task-manager.ts";
+import type { TaskStateTransition } from "./tasks/types.ts";
 import {
 	shouldFireTodoGate,
 	TodoNudgeTracker,
@@ -206,6 +225,7 @@ import { createTaskToolDefinition } from "./tools/task.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { boundToolResultContent } from "./tools/tool-result-budget.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./tools/truncate.ts";
+import { createUpgradeExecutionToolDefinition } from "./tools/upgrade-execution.ts";
 import {
 	createDefaultWebFetchOperations,
 	createWebFetchToolDefinition,
@@ -273,6 +293,7 @@ export type AgentSessionEvent =
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "execution_upgrade"; outcome: ExecutionUpgradeOutcome; taskId?: string }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -314,6 +335,8 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	/** A child captures the parent's upgrade policy at spawn time. */
+	executionUpgrade?: ExecutionUpgradeConfig;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -349,6 +372,8 @@ export interface AgentSessionConfig {
 	subagentDepth?: number;
 	/** Root directory for the Grok-aligned memory system (memory_search/memory_get + compaction memory flush). Default: getMemoryDir() (~/.pi/agent/memory). Tests should override this to a tmpdir. */
 	memoryRootDir?: string;
+	/** Deterministic archive extractor injection. Production uses the configured model with no tools. */
+	memoryArchiveExtractor?: MemoryArchiveExtractor;
 	/** Language server configs for the `lsp` tool. The tool is not registered when omitted or empty. */
 	lspServers?: LspServerConfig[];
 	/** MCP server configs. search_tool/use_tool only register when this is non-empty (Grok two-stage discovery, spec 13). */
@@ -417,6 +442,18 @@ export interface SessionStats {
 	contextUsage?: ContextUsage;
 }
 
+export interface MemoryFlushResult {
+	attempted: boolean;
+	status: "processed" | "deferred" | "disabled";
+	jobId?: string;
+	manifestId?: string;
+	written: number;
+	skipped: number;
+	remainingSources: number;
+	reasons: string[];
+	warning?: string;
+}
+
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
@@ -448,13 +485,22 @@ const SAVE_STATE_CONTENT_INSTRUCTION =
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
-const SAVE_STATE_TOOL_NAMES = ["history", "context_note", "get_context_remaining", "new_context"] as const;
+const SAVE_STATE_TOOL_NAMES = CONTEXT_CONTROL_TOOLS;
 
 // ============================================================================
 // AgentSession Class
 // ============================================================================
 
 export class AgentSession {
+	private _executionMonitor = new ExecutionMonitor();
+	private _executionUpgradeOverride?: ExecutionUpgradeConfig;
+	private _selectionRevision = 0;
+	private _executionRequestRevision = 0;
+	private _preparedExecutionRevision = 0;
+	private _executionBusinessRequest = false;
+	private _executionToolRequests = new Map<string, { request: ExecutionUpgradeRequest; revision: number }>();
+	private _pendingExecutionUpgrade?: { outcome: ExecutionUpgradeOutcome; revision: number };
+	private _lastExecutionUpgrade?: ExecutionUpgradeOutcome;
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
@@ -516,6 +562,19 @@ export class AgentSession {
 	private _subagentDepth = 0;
 	private _subagentCoordinator!: SubagentCoordinator;
 	private _memoryStore!: MemoryStore;
+	private _memoryAuthority!: MemoryAuthority;
+	private _memoryArchiveService: MemoryArchiveService | undefined;
+	private _memoryArchiveEnabled = false;
+	private _memoryRootPromptId: string | undefined;
+	private _memoryRootSourceId: string | undefined;
+	private _memoryRootSourceContent: string | undefined;
+	private _memoryEvidenceSequence = 0;
+	private _taskMemorySequence = new Map<string, number>();
+	private _taskMemoryEvidenceFailed = new Set<string>();
+	private _memoryQueueOrigins = new Map<string, "user" | "runtime" | "extension">();
+	private _memoryArchiveProcessing: Promise<void> | undefined;
+	private _memoryArchiveRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	private _disposed = false;
 	private _lspManager!: LspManager;
 	private _lspEnabled = false;
 	private _mcpManager!: McpManager;
@@ -559,6 +618,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this._pendingDeliveryStore = new PendingDeliveryStore(this.sessionManager);
 		this.settingsManager = config.settingsManager;
+		this._executionUpgradeOverride = config.executionUpgrade ? structuredClone(config.executionUpgrade) : undefined;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -593,48 +653,217 @@ export class AgentSession {
 			...reminderPolicy.todoNudge,
 			enabled: reminderPolicy.enabled && reminderPolicy.todoNudge.enabled,
 		});
-		this._taskManager = new TaskManager((transition) => {
-			if (["completed", "blocked", "failed", "cancelled"].includes(transition.to))
-				this._scheduleDeferredContextTransition();
-			let turn = this._taskTraceTurns.get(transition.taskId);
-			if (transition.from === undefined) {
-				if (this._traceTurn === undefined) return;
-				turn = this._traceTurn;
-				this._taskTraceTurns.set(transition.taskId, turn);
-			}
-			if (turn === undefined) return;
-			this.sessionManager.appendTrace({ type: "task/state", data: { turn, ...transition } });
-			if (
-				transition.to === "completed" ||
-				transition.to === "blocked" ||
-				transition.to === "failed" ||
-				transition.to === "cancelled"
-			) {
-				const completedTask =
-					transition.to === "completed"
-						? this._taskManager
-								.list()
-								.find((task) => task.taskId === transition.taskId && task.status === "completed")
-						: undefined;
+		this._subagentDepth = config.subagentDepth ?? 0;
+		const memoryRoot = config.memoryRootDir ?? getMemoryDir();
+		const memorySettings = this.settingsManager.getMemorySettings();
+		const memoryEmbeddingConfig = resolveEmbeddingConfig(memorySettings.embedding, process.env);
+		this._memoryStore = new MemoryStore(
+			memoryRoot,
+			memoryEmbeddingConfig ? createOpenAiCompatibleEmbedder(memoryEmbeddingConfig) : undefined,
+		);
+		const archiveExtractor =
+			config.memoryArchiveExtractor ??
+			({
+				extract: async (sources, archiveSignal) => {
+					const model = this.model;
+					if (!model) throw new Error("memory_archive_no_model");
+					const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+					const controller = new AbortController();
+					const onArchiveAbort = () => controller.abort();
+					if (archiveSignal?.aborted) controller.abort();
+					else archiveSignal?.addEventListener("abort", onArchiveAbort, { once: true });
+					const timeout = setTimeout(() => controller.abort(), memorySettings.archive.modelCallTimeoutMs);
+					try {
+						return await extractArchivedMemory(
+							sources,
+							model,
+							{
+								apiKey,
+								headers,
+								env,
+								signal: controller.signal,
+								maxTokens: memorySettings.archive.maxOutputTokensPerCall,
+							},
+							this.agent.streamFunction,
+							memorySettings.archive.maxCandidatesPerBatch,
+							(usage) =>
+								this._appendTraceSafely({
+									type: "memory/archive",
+									data: {
+										turn: Math.max(0, this._nextTraceTurn - 1),
+										phase: "processing",
+										ran: true,
+										reason: "extraction_model_call",
+										usage,
+									},
+								}),
+						);
+					} finally {
+						clearTimeout(timeout);
+						archiveSignal?.removeEventListener("abort", onArchiveAbort);
+					}
+				},
+				validate: async (candidate, sources, conflicts, archiveSignal) => {
+					const model = this.model;
+					if (!model) throw new Error("memory_archive_no_model");
+					const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+					const controller = new AbortController();
+					const onArchiveAbort = () => controller.abort();
+					if (archiveSignal?.aborted) controller.abort();
+					else archiveSignal?.addEventListener("abort", onArchiveAbort, { once: true });
+					const timeout = setTimeout(() => controller.abort(), memorySettings.archive.modelCallTimeoutMs);
+					try {
+						return await validateArchivedMemoryCandidate(
+							candidate,
+							sources,
+							conflicts,
+							model,
+							{
+								apiKey,
+								headers,
+								env,
+								signal: controller.signal,
+								maxTokens: memorySettings.archive.maxOutputTokensPerCall,
+							},
+							this.agent.streamFunction,
+							(usage) =>
+								this._appendTraceSafely({
+									type: "memory/archive",
+									data: {
+										turn: Math.max(0, this._nextTraceTurn - 1),
+										phase: "processing",
+										ran: true,
+										reason: "validation_model_call",
+										usage,
+									},
+								}),
+						);
+					} finally {
+						clearTimeout(timeout);
+						archiveSignal?.removeEventListener("abort", onArchiveAbort);
+					}
+				},
+			} satisfies MemoryArchiveExtractor);
+		this._memoryArchiveService = memorySettings.enabled
+			? new MemoryArchiveService(memoryRoot, this._cwd, archiveExtractor, {
+					maxConcurrencyPerProject: memorySettings.archive.maxConcurrencyPerProject,
+					maxFailuresPerWorkItem: memorySettings.archive.maxFailuresPerWorkItem,
+					maxInputTokensPerCall: memorySettings.archive.maxInputTokensPerCall,
+					maxModelCallsPerProjectHour: memorySettings.archive.maxModelCallsPerProjectHour,
+					maxCandidatesPerBatch: memorySettings.archive.maxCandidatesPerBatch,
+					maxModelCallsPerSlice: memorySettings.archive.maxModelCallsPerSlice,
+				})
+			: undefined;
+		this._memoryAuthority = this._memoryArchiveService?.authority ?? new MemoryAuthority(memoryRoot, this._cwd);
+		this._memoryArchiveEnabled =
+			memorySettings.enabled && memorySettings.archive.enabled && this._subagentDepth === 0;
+		const allMemoryEvidence = this.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "memory_evidence" && entry.visibility !== "project_rule");
+		for (const entry of allMemoryEvidence) {
+			if (entry.type !== "memory_evidence") continue;
+			const run = this._memoryAuthority.getRun(entry.rootPromptId);
+			if (run?.sessionId !== this.sessionId) continue;
+			try {
 				if (
-					completedTask?.status === "completed" &&
-					(completedTask.result !== undefined || completedTask.exitCode === 0)
+					run.pendingEvidenceIds.includes(entry.evidenceEventId) ||
+					!run.sourceIds.includes(entry.evidenceEventId)
 				) {
-					this.sessionManager.appendContextProgress({
-						evidenceId: fingerprintContextRolloverValue({ kind: "task_completed", taskId: transition.taskId }),
-						evidenceKind: "task_completed",
-						targetFingerprint: fingerprintContextRolloverValue({ taskId: transition.taskId }),
-						resultFingerprint: fingerprintContextRolloverValue({
-							result: completedTask.result,
-							exitCode: completedTask.exitCode,
-						}),
-						outcome: "succeeded",
-						taskId: transition.taskId,
+					this._memoryArchiveService?.recordEvidence(entry.rootPromptId, {
+						sourceId: entry.evidenceEventId,
+						origin: entry.origin,
+						content: entry.content,
+						visibility: entry.visibility,
+						completeness: entry.completeness,
+						entryId: entry.sourceEntryId ?? entry.id,
+						toolCallId: entry.toolCallId,
+						taskId: entry.taskId,
 					});
 				}
-				this._taskTraceTurns.delete(transition.taskId);
+				if (entry.deliveryState === "delivered" && entry.sourceEntryId) {
+					this._memoryAuthority.bindEvidenceSourceEntry(
+						entry.rootPromptId,
+						entry.evidenceEventId,
+						entry.sourceEntryId,
+					);
+				}
+			} catch {
+				// Pending evidence remains authoritative and blocks archive eligibility.
 			}
-		});
+		}
+		const branchIds = new Set(this.sessionManager.getBranch().map((entry) => entry.id));
+		const deliveredEvidenceIds = new Set(
+			allMemoryEvidence
+				.filter((entry) => entry.type === "memory_evidence" && entry.deliveryState === "delivered")
+				.map((entry) => (entry.type === "memory_evidence" ? entry.evidenceEventId : "")),
+		);
+		const persistedMemoryRun = [...allMemoryEvidence]
+			.reverse()
+			.find(
+				(entry) =>
+					entry.type === "memory_evidence" &&
+					(entry.parentId === null || branchIds.has(entry.parentId)) &&
+					(entry.deliveryState === "delivered" || !deliveredEvidenceIds.has(entry.evidenceEventId)),
+			);
+		if (persistedMemoryRun?.type === "memory_evidence") {
+			const rootPromptId = persistedMemoryRun.rootPromptId;
+			const run = this._memoryAuthority.getRun(rootPromptId);
+			if (run?.sessionId === this.sessionId) {
+				this._memoryRootPromptId = rootPromptId;
+				if (run.mainState === "running") {
+					this._memoryArchiveService?.settleRun(rootPromptId, undefined, "outcome_unknown");
+				}
+			}
+		}
+		this._taskManager = new TaskManager(
+			(transition) => {
+				this._recordMemoryTaskTransition(transition);
+				if (["completed", "blocked", "failed", "cancelled"].includes(transition.to))
+					this._scheduleDeferredContextTransition();
+				let turn = this._taskTraceTurns.get(transition.taskId);
+				if (transition.from === undefined) {
+					if (this._traceTurn === undefined) return;
+					turn = this._traceTurn;
+					this._taskTraceTurns.set(transition.taskId, turn);
+				}
+				if (turn === undefined) return;
+				this.sessionManager.appendTrace({ type: "task/state", data: { turn, ...transition } });
+				if (
+					transition.to === "completed" ||
+					transition.to === "blocked" ||
+					transition.to === "failed" ||
+					transition.to === "cancelled"
+				) {
+					const completedTask =
+						transition.to === "completed"
+							? this._taskManager
+									.list()
+									.find((task) => task.taskId === transition.taskId && task.status === "completed")
+							: undefined;
+					if (
+						completedTask?.status === "completed" &&
+						(completedTask.result !== undefined || completedTask.exitCode === 0)
+					) {
+						this.sessionManager.appendContextProgress({
+							evidenceId: fingerprintContextRolloverValue({ kind: "task_completed", taskId: transition.taskId }),
+							evidenceKind: "task_completed",
+							targetFingerprint: fingerprintContextRolloverValue({ taskId: transition.taskId }),
+							resultFingerprint: fingerprintContextRolloverValue({
+								result: completedTask.result,
+								exitCode: completedTask.exitCode,
+							}),
+							outcome: "succeeded",
+							taskId: transition.taskId,
+						});
+					}
+					this._taskTraceTurns.delete(transition.taskId);
+				}
+			},
+			() => ({ ownerSessionId: this.sessionId, rootPromptId: this._memoryRootPromptId }),
+			(taskId, chunk) => {
+				this._recordMemoryTaskOutput(taskId, chunk);
+			},
+		);
 		// Grok-aligned TodoState persistence (spec 6.4): restore from the session's latest "todo-state"
 		// custom entry if one exists (resume/reload), otherwise start empty. The tool wiring below
 		// (see the todo_write tool construction in _buildRuntime) persists every subsequent mutation
@@ -649,9 +878,7 @@ export class AgentSession {
 			agent: this.agent,
 			manager: this.sessionManager,
 			revisions: () => this._contextRolloverRevisions(),
-			isBusy: () =>
-				this._pendingInteractions.list().length > 0 ||
-				this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling"),
+			transitionGate: (requiredTaskIds) => this.getContextTransitionGate(requiredTaskIds),
 			isCancelled: () => this._promptAborted,
 			pendingDeliveryIds: () => this._pendingDeliveryStore.snapshot().items.map((item) => item.queueItemId),
 			canRecover: (recovery) => this._canRecoverContext(recovery),
@@ -666,15 +893,6 @@ export class AgentSession {
 					data: { turn: Math.max(0, this._nextTraceTurn - 1), ...data },
 				}),
 		});
-		this._subagentDepth = config.subagentDepth ?? 0;
-		const memoryEmbeddingConfig = resolveEmbeddingConfig(
-			this.settingsManager.getMemorySettings().embedding,
-			process.env,
-		);
-		this._memoryStore = new MemoryStore(
-			config.memoryRootDir ?? getMemoryDir(),
-			memoryEmbeddingConfig ? createOpenAiCompatibleEmbedder(memoryEmbeddingConfig) : undefined,
-		);
 		this._lspEnabled = (config.lspServers?.length ?? 0) > 0;
 		this._lspManager = new LspManager({
 			cwd: this._cwd,
@@ -687,11 +905,14 @@ export class AgentSession {
 		this._sandboxProfileOverride = config.sandboxProfileOverride;
 		this._subagentCoordinator = new SubagentCoordinator(
 			this._taskManager,
-			(request: SubagentChildRequest, signal: AbortSignal) =>
-				runPiChildAgent({
+			(request: SubagentChildRequest, signal: AbortSignal) => {
+				if (!request.execution) throw new Error("Subagent execution profile was not captured at spawn.");
+				return runPiChildAgent({
 					deps: {
 						cwd: request.cwd,
-						model: this.agent.state.model,
+						model: request.execution.model,
+						thinkingLevel: request.execution.thinkingLevel,
+						executionUpgrade: request.execution.upgrade,
 						modelRuntime: this._modelRuntime,
 						resourceLoader: this._resourceLoader,
 						settingsManager: this.settingsManager,
@@ -705,8 +926,47 @@ export class AgentSession {
 					},
 					prompt: request.prompt,
 					signal,
+					onRequest: (header, sessionId, promptGeneration) => {
+						this._appendTraceSafely({
+							type: "task/request",
+							data: {
+								turn: this._taskTraceTurns.get(request.taskId) ?? Math.max(0, this._nextTraceTurn - 1),
+								taskId: request.taskId,
+								sessionId,
+								promptGeneration,
+								header,
+							},
+						});
+					},
+					onUpgrade: (outcome, sessionId, promptGeneration) => {
+						this._appendTraceSafely({
+							type: "execution/upgrade",
+							data: {
+								turn: this._taskTraceTurns.get(request.taskId) ?? Math.max(0, this._nextTraceTurn - 1),
+								step: -1,
+								sessionId,
+								promptGeneration,
+								taskId: request.taskId,
+								outcome,
+							},
+						});
+						this._emit({ type: "execution_upgrade", taskId: request.taskId, outcome });
+					},
+				});
+			},
+			{
+				depth: this._subagentDepth,
+				cwd: this._cwd,
+				ownerSessionId: this.sessionId,
+				getRootPromptId: () => this._memoryRootPromptId,
+				captureExecution: () => ({
+					model: structuredClone(this.agent.state.model),
+					thinkingLevel: this.thinkingLevel,
+					upgrade: structuredClone(
+						this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings(),
+					),
 				}),
-			{ depth: this._subagentDepth, cwd: this._cwd },
+			},
 		);
 
 		// Always subscribe to agent events for internal handling
@@ -715,11 +975,13 @@ export class AgentSession {
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 		this._installContextGuard();
+		this._installExecutionUpgrade();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		if (this._memoryRootPromptId) this._requestMemoryArchiveCheck(this._memoryRootPromptId);
 
 		// Restore Plan Mode across resume/reload (spec 7). "awaiting_approval" collapses to "planning":
 		// its PendingInteraction cannot survive a process restart, but the mutation-disabling intent it
@@ -752,61 +1014,364 @@ export class AgentSession {
 		return this._memoryStore;
 	}
 
-	/**
-	 * Manual memory flush (spec 10.5 Phase 1: "手动 /memory flush"). Summarizes everything in the current
-	 * branch (not just a to-be-dropped compaction prefix — keepRecentTokens is forced to 0 so almost all
-	 * of it lands in messagesToSummarize) and writes the result into *project* memory, through the same
-	 * secret filter as every other memory write (see appendProject). This never touches the live session: no
-	 * messages are dropped and no compaction entry is appended.
-	 */
-	async flushMemoryNow(
-		customInstructions?: string,
-	): Promise<{ attempted: boolean; written: number; skipped: number; reasons: string[]; warning?: string }> {
-		if (!this.model) {
-			return { attempted: false, written: 0, skipped: 0, reasons: ["no_model"], warning: "no model is configured" };
+	get memoryAuthority(): MemoryAuthority {
+		return this._memoryAuthority;
+	}
+
+	rememberMemoryRule(text: string): { memoryId: string; revision: number } {
+		const normalized = text.trim();
+		if (!normalized) throw new Error("memory_rule_empty");
+		if (!this.settingsManager.getMemorySettings().enabled) throw new Error("memory_disabled");
+		const rootPromptId = randomUUID();
+		const sourceId = `evidence-${randomUUID()}`;
+		const entryId = this.sessionManager.appendMemoryEvidence({
+			evidenceEventId: sourceId,
+			rootPromptId,
+			origin: "user",
+			content: normalized,
+			visibility: "project_rule",
+		});
+		const record = this._memoryAuthority.rememberUserRule({
+			rootPromptId,
+			sessionId: this.sessionId,
+			sourceId,
+			entryId,
+			text: normalized,
+			contentHash: createHash("sha256").update(normalized).digest("hex"),
+		});
+		return { memoryId: record.memoryId, revision: record.revision };
+	}
+
+	revokeMemory(memoryId: string): boolean {
+		try {
+			this._memoryAuthority.revokeMemory(memoryId, "explicit_user_revoke");
+			return true;
+		} catch (error) {
+			if (error instanceof Error && error.message === "memory_record_not_found") return false;
+			throw error;
 		}
-		const pathEntries = this.sessionManager.getBranch();
-		const settings = this.settingsManager.getCompactionSettings();
-		const preparation = prepareCompaction(pathEntries, { ...settings, keepRecentTokens: 0 });
-		if (!preparation) {
+	}
+
+	getMemoryStatus(): MemoryArchiveStatus {
+		return this._memoryAuthority.getStatus();
+	}
+
+	private _recordMemoryEvidence(rootPromptId: string, input: MemoryEvidenceInput): boolean {
+		if (!this._memoryArchiveService) return false;
+		try {
+			const evidenceEntryId = this.sessionManager.appendMemoryEvidence({
+				evidenceEventId: input.sourceId,
+				rootPromptId,
+				origin: input.origin,
+				content: input.content,
+				visibility: input.visibility,
+				completeness: input.completeness,
+				sourceEntryId: input.entryId,
+				toolCallId: input.toolCallId,
+				taskId: input.taskId,
+			});
+			this._memoryArchiveService.recordEvidence(rootPromptId, {
+				...input,
+				entryId: input.entryId ?? evidenceEntryId,
+			});
+			return true;
+		} catch (error) {
+			this._appendTraceSafely({
+				type: "memory/archive",
+				data: {
+					turn: Math.max(0, this._nextTraceTurn - 1),
+					ran: false,
+					reason: error instanceof Error ? error.message : "memory_evidence_write_failed",
+					written: 0,
+					skipped: 1,
+				},
+			});
+			return false;
+		}
+	}
+
+	private _startMemoryRun(originalText: string, transformedText: string, expandedText: string): void {
+		const service = this._memoryArchiveService;
+		if (!service) return;
+		const rootPromptId = randomUUID();
+		const sourceId = `evidence-${randomUUID()}`;
+		const branchStartEntryId = this.sessionManager.getLeafId() ?? undefined;
+		const sourceEntryId = this.sessionManager.appendMemoryEvidence({
+			evidenceEventId: sourceId,
+			rootPromptId,
+			origin: "user",
+			content: originalText,
+			visibility: "session",
+			deliveryState: "pending",
+		});
+		service.startRun({
+			rootPromptId,
+			sessionId: this.sessionId,
+			branchStartEntryId,
+			taskSourceEntryId: sourceEntryId,
+			promptGeneration: this.sessionManager.getLatestContextCoordinates().promptGeneration + 1,
+		});
+		service.recordEvidence(rootPromptId, {
+			sourceId,
+			origin: "user",
+			content: originalText,
+			visibility: "session",
+			entryId: sourceEntryId,
+		});
+		this._memoryRootPromptId = rootPromptId;
+		this._memoryRootSourceId = sourceId;
+		this._memoryRootSourceContent = originalText;
+		this._memoryEvidenceSequence = 0;
+		if (transformedText !== originalText) {
+			this._recordMemoryEvidence(rootPromptId, {
+				sourceId: `${rootPromptId}:extension-input`,
+				origin: "extension",
+				content: transformedText,
+				visibility: "session",
+			});
+		}
+		if (expandedText !== transformedText) {
+			this._recordMemoryEvidence(rootPromptId, {
+				sourceId: `${rootPromptId}:runtime-input`,
+				origin: "runtime",
+				content: expandedText,
+				visibility: "session",
+			});
+		}
+	}
+
+	private _settleCurrentMemoryRun(forcedOutcome?: NonNullable<MemoryRun["outcome"]>): void {
+		const rootPromptId = this._memoryRootPromptId;
+		const service = this._memoryArchiveService;
+		if (!rootPromptId || !service) return;
+		const run = service.authority.getRun(rootPromptId);
+		if (!run) return;
+		const rolloverDispatchState = this.contextRolloverState.dispatchState;
+		const continuationState: MemoryRun["continuationState"] =
+			rolloverDispatchState === "outcome_unknown"
+				? "outcome_unknown"
+				: this._deferredContextTransition ||
+						this._pendingInteractions.list().length > 0 ||
+						rolloverDispatchState === "prepared" ||
+						rolloverDispatchState === "started"
+					? "pending"
+					: "none";
+		const state = this.agent.state.runState;
+		const lastOutcome = state.status === "idle" ? state.lastOutcome?.type : undefined;
+		let outcome: NonNullable<MemoryRun["outcome"]> = forcedOutcome ?? "completed";
+		if (!forcedOutcome && (this._promptAborted || lastOutcome === "aborted")) outcome = "interrupted";
+		else if (
+			!forcedOutcome &&
+			(lastOutcome === "failed" ||
+				lastOutcome === "context_limit" ||
+				lastOutcome === "context_maintenance" ||
+				lastOutcome === "context_transition")
+		)
+			outcome = "failed";
+		service.settleRun(rootPromptId, continuationState === "none" ? outcome : undefined, continuationState);
+		this._requestMemoryArchiveCheck(rootPromptId);
+	}
+
+	private _recordMemoryTaskOutput(taskId: string, chunk: string): void {
+		if (!this._memoryArchiveService || !chunk) return;
+		const task = this._taskManager.get(taskId);
+		if (!task?.rootPromptId) return;
+		const sequence = this._taskMemorySequence.get(taskId) ?? 0;
+		this._taskMemorySequence.set(taskId, sequence + 1);
+		if (
+			!this._recordMemoryEvidence(task.rootPromptId, {
+				sourceId: `${taskId}:output:${sequence}`,
+				origin: task.kind === "subagent" ? "subagent" : "tool",
+				content: chunk,
+				visibility: "session",
+				taskId,
+			})
+		) {
+			this._taskMemoryEvidenceFailed.add(taskId);
+		}
+	}
+
+	private _recordMemoryTaskTransition(transition: TaskStateTransition): void {
+		const service = this._memoryArchiveService;
+		const rootPromptId = transition.rootPromptId;
+		if (!service || !rootPromptId) return;
+		try {
+			if (transition.from === undefined) {
+				service.registerTask(rootPromptId, transition.taskId, transition.archiveRole);
+				return;
+			}
+			if (!["completed", "blocked", "failed", "cancelled"].includes(transition.to)) return;
+			const snapshot = this._taskManager.get(transition.taskId);
+			const recorded = this._recordMemoryEvidence(rootPromptId, {
+				sourceId: `${transition.taskId}:terminal`,
+				origin: transition.kind === "subagent" ? "subagent" : "tool",
+				content: JSON.stringify(snapshot ?? transition),
+				visibility: "session",
+				taskId: transition.taskId,
+				completeness: this._taskMemoryEvidenceFailed.has(transition.taskId) ? "partial" : "complete",
+			});
+			if (!recorded) throw new Error("memory_task_evidence_unavailable");
+			service.recordTaskEvidence(rootPromptId, transition.taskId, "durable");
+			this._taskMemorySequence.delete(transition.taskId);
+			this._taskMemoryEvidenceFailed.delete(transition.taskId);
+			this._requestMemoryArchiveCheck(rootPromptId);
+		} catch {
+			try {
+				service.recordTaskEvidence(rootPromptId, transition.taskId, "unavailable");
+			} catch {
+				// The original evidence failure remains authoritative.
+			}
+		}
+	}
+
+	private _requestMemoryArchiveCheck(rootPromptId: string): void {
+		if (!this._memoryArchiveEnabled || !this._memoryArchiveService) return;
+		try {
+			if (this._memoryArchiveService.checkArchiveEligibility(rootPromptId).status === "ready") {
+				const job = this._memoryArchiveService.sealRun(rootPromptId);
+				this._appendTraceSafely({
+					type: "memory/archive",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						rootPromptId,
+						jobId: job.jobId,
+						manifestId: job.manifestId,
+						phase: "sealed",
+						ran: true,
+						reason: "archive_ready",
+					},
+				});
+				this._scheduleMemoryArchiveProcessing();
+			}
+		} catch {
+			// Persisted run/job state remains available for status and recovery.
+		}
+	}
+
+	private _scheduleMemoryArchiveProcessing(): void {
+		if (this._disposed || this._memoryArchiveProcessing || !this._memoryArchiveService) return;
+		this._memoryArchiveProcessing = this.drainMemoryArchive().finally(() => {
+			this._memoryArchiveProcessing = undefined;
+			if ((this._memoryArchiveService?.authority.getStatus().jobs.queued ?? 0) > 0) {
+				setTimeout(() => this._scheduleMemoryArchiveProcessing(), 0);
+			}
+		});
+	}
+
+	private _scheduleMemoryArchiveRetry(retryAt: string): void {
+		if (this._disposed || this._memoryArchiveRetryTimer) return;
+		const delay = Math.max(0, Date.parse(retryAt) - Date.now());
+		this._memoryArchiveRetryTimer = setTimeout(
+			() => {
+				this._memoryArchiveRetryTimer = undefined;
+				this._scheduleMemoryArchiveProcessing();
+			},
+			Math.min(delay, 2_147_483_647),
+		);
+		this._memoryArchiveRetryTimer.unref?.();
+	}
+
+	async drainMemoryArchive(): Promise<void> {
+		if (this._memoryArchiveProcessing) {
+			await this._memoryArchiveProcessing;
+			return;
+		}
+		const service = this._memoryArchiveService;
+		if (!service) return;
+		while (true) {
+			const result = await service.processNext();
+			if (result.status !== "idle") {
+				this._appendTraceSafely({
+					type: "memory/archive",
+					data: {
+						turn: Math.max(0, this._nextTraceTurn - 1),
+						jobId: result.jobId,
+						phase:
+							result.status === "completed"
+								? "completed"
+								: result.status === "retryable_failed" || result.status === "needs_review"
+									? "failed"
+									: "processing",
+						ran: true,
+						reason: result.status,
+						written: result.accepted,
+						skipped: result.rejected,
+					},
+				});
+			}
+			if (result.status === "budget_wait") {
+				if (result.retryAt) this._scheduleMemoryArchiveRetry(result.retryAt);
+				return;
+			}
+			if (result.status === "idle" || result.status === "needs_review" || result.status === "yielded") return;
+			if (result.status === "retryable_failed") service.requeueFailedJobs();
+		}
+	}
+
+	/**
+	 * Seal and process the current closed evidence run. This uses the normal archive job, validation,
+	 * conflict, and authority transaction path. It does not summarize or mutate the live context.
+	 */
+	async flushMemoryNow(): Promise<MemoryFlushResult> {
+		const service = this._memoryArchiveService;
+		const rootPromptId = this._memoryRootPromptId;
+		if (!service || !rootPromptId) {
 			return {
 				attempted: false,
+				status: "disabled",
 				written: 0,
 				skipped: 0,
-				reasons: ["no_new_content"],
-				warning: "nothing new to summarize yet",
+				remainingSources: 0,
+				reasons: [service ? "no_current_run" : "memory_disabled"],
 			};
 		}
-		const model = this.model;
-		try {
-			const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
-			const result = await compact(
-				preparation,
-				model,
-				apiKey,
-				headers,
-				customInstructions ??
-					"Manual memory flush: extract durable facts, decisions, and conventions worth remembering long-term.",
-				undefined,
-				this.thinkingLevel,
-				this.agent.streamFunction,
-				env,
-				this.settingsManager.getRetrySettings(),
-			);
-			const appendResult = this._memoryStore.appendProject(this._cwd, [result.summary]);
+		if (this._memoryArchiveProcessing) await this._memoryArchiveProcessing;
+		const eligibility = service.checkArchiveEligibility(rootPromptId);
+		if (eligibility.status !== "ready") {
 			return {
-				attempted: true,
-				written: appendResult.written,
-				skipped: appendResult.skipped,
-				warning: appendResult.warning,
-				reasons: appendResult.reasons,
-			};
-		} catch {
-			return {
-				attempted: true,
+				attempted: false,
+				status: "deferred",
 				written: 0,
 				skipped: 0,
-				reasons: ["memory_flush_failed"],
+				remainingSources: service.authority.getRun(rootPromptId)?.sourceIds.length ?? 0,
+				reasons: [eligibility.status],
+			};
+		}
+		try {
+			const job = service.sealRun(rootPromptId);
+			this._appendTraceSafely({
+				type: "memory/archive",
+				data: {
+					turn: Math.max(0, this._nextTraceTurn - 1),
+					rootPromptId,
+					jobId: job.jobId,
+					manifestId: job.manifestId,
+					phase: "sealed",
+					ran: true,
+					reason: "manual_flush",
+				},
+			});
+			await this.drainMemoryArchive();
+			const completed = service.authority.getJob(job.jobId) ?? job;
+			return {
+				attempted: true,
+				status: completed.status === "completed" ? "processed" : "deferred",
+				jobId: job.jobId,
+				manifestId: job.manifestId,
+				written: completed.accepted,
+				skipped: completed.rejected,
+				remainingSources:
+					completed.status === "completed" ? 0 : (service.authority.getRun(rootPromptId)?.sourceIds.length ?? 0),
+				reasons: completed.reasonCode ? [completed.reasonCode] : [],
+			};
+		} catch (error) {
+			return {
+				attempted: true,
+				status: "deferred",
+				written: 0,
+				skipped: 0,
+				remainingSources: service.authority.getRun(rootPromptId)?.sourceIds.length ?? 0,
+				reasons: [error instanceof Error ? error.message : "memory_flush_failed"],
 				warning: "memory flush failed",
 			};
 		}
@@ -1028,7 +1593,7 @@ export class AgentSession {
 
 	private _startSaveState(
 		requestFingerprint: string,
-		transitionCause: ContextTransitionCause = "work_budget_reached",
+		transitionCause: ContextControlCause = "work_budget_reached",
 	):
 		| { type: "failed"; message: string }
 		| {
@@ -1040,7 +1605,11 @@ export class AgentSession {
 		  } {
 		const { windowId } = this.sessionManager.ensureContextWindow();
 		const coordinates = this.sessionManager.getLatestContextCoordinates();
-		if (!SAVE_STATE_TOOL_NAMES.every((toolName) => this.getActiveToolNames().includes(toolName))) {
+		if (
+			!["history", "context_note", "get_context_remaining", "new_context"].every((toolName) =>
+				this.getActiveToolNames().includes(toolName),
+			)
+		) {
 			return { type: "failed", message: "recovery_unavailable: missing save-state tool" };
 		}
 		if (
@@ -1091,12 +1660,18 @@ export class AgentSession {
 				role: "custom",
 				customType: "context-save-state",
 				content:
-					"State saving started before rollover; no resumeRef exists yet. Do not use the business cutoff entry ID as a resumeRef. " +
-					'First call history exactly with {"operation":"list_items","role":"user"}; list_windows is insufficient because it does not return the source entry IDs. ' +
-					'Query existing Notes with context_note {"operation":"query"} and no resumeRef. ' +
+					(transitionCause === "model_requested"
+						? "You requested a new window. Save the continuation before rollover. "
+						: "Shake and Compaction have been attempted. The working context is full. Decide whether to finish here or request a fresh window with new_context. Only your explicit new_context call authorizes rollover. ") +
+					`Current budget: ${JSON.stringify(this._contextRemaining)}. ` +
+					"No resumeRef exists yet. Do not use the business cutoff entry ID as a resumeRef. " +
+					`At most ${SAVE_STATE_MAX_SAMPLES} model responses remain for the entire decision and save sequence. Batch independent control calls in the same response. ` +
+					'In the first batch, discover source IDs with history {"operation":"list_items","role":"user"} and query existing Notes with context_note {"operation":"query"} and no resumeRef. Skip reads whose results are already visible. list_windows is insufficient because it does not return source entry IDs. ' +
+					"If you choose rollover and have not requested it, include new_context in that batch. Synchronize existing Todo progress in that batch when needed; do not create Todos solely to switch windows. " +
 					`${SAVE_STATE_SUPERSESSION_INSTRUCTION} ` +
 					`${SAVE_STATE_CONTENT_INSTRUCTION} ` +
-					'Then call context_note with {"operation":"upsert","kind":"next_action","key":"current","text":"...","sourceRefs":[...],"evidenceRefs":[],"resume":{"relatedNotes":[],"requiredHistoryRefs":[...],"requirementSourceRefs":[...],"todoIds":[...]}}. ' +
+					"Synchronize Todo progress with todo_write if needed before saving next_action/current. Preserve every unfinished task. Todo status is authoritative; do not declare completion in a Note. " +
+					'Then call context_note with {"operation":"upsert","kind":"next_action","key":"current","text":"...","sourceRefs":[...],"evidenceRefs":[],"resume":{"relatedNotes":[],"requiredHistoryRefs":[...],"requirementSourceRefs":[...],"todoIds":[...],"subagentContinuations":[]}}. For every delegated task in this task scope (including terminal tasks), still-active earlier child and referenced child, populate subagentContinuations with taskId, parentRelation and onResult. Record dependent/independent parent work and result checks/use, or evidence it was already handled. Do not infer handled from terminal status. ' +
 					'The key must be exactly "current". Include any directly required Notes and references in resume. Ordinary business tools are unavailable.',
 				display: false,
 				details: { windowId, businessCutoffEntryId },
@@ -1352,6 +1927,7 @@ export class AgentSession {
 		if (operation && !operation.finished) {
 			const usage = this._saveStateUsage(operation.businessCutoffEntryId);
 			const validation = validateContinuationState(this.sessionManager, operation);
+			const requested = this._pendingContextTransition();
 			const base = {
 				operationId: operation.operationId,
 				operationKind: "save_state" as const,
@@ -1368,11 +1944,20 @@ export class AgentSession {
 				consumedControlTokens: usage.controlTokens,
 				consumedOutputTokens: usage.outputTokens,
 			};
-			if (validation.status === "valid") {
+			if (!requested && turn.message.stopReason === "stop") {
+				this.sessionManager.appendContextOperation({
+					...base,
+					state: "finished",
+					outcome: "completed_without_rollover",
+				});
+				return undefined;
+			}
+			if (validation.status === "valid" && requested) {
 				this._finishSaveState(operation, usage, validation);
 				return { type: "context_transition" };
 			}
-			this.sessionManager.appendContextOperation({ ...base, state: "started", outcome: validation.reason });
+			const reason = validation.status === "invalid" ? validation.reason : "model_request_missing";
+			this.sessionManager.appendContextOperation({ ...base, state: "started", outcome: reason });
 			const remainingControl = operation.controlBudgetTokens - usage.controlTokens;
 			const remainingOutput = operation.outputBudgetTokens - usage.outputTokens;
 			if (usage.samplesUsed >= SAVE_STATE_MAX_SAMPLES || remainingControl <= 0 || remainingOutput <= 0) {
@@ -1387,10 +1972,10 @@ export class AgentSession {
 						samplesUsed: usage.samplesUsed,
 						consumedControlTokens: usage.controlTokens,
 						consumedOutputTokens: usage.outputTokens,
-						reasonCode: validation.reason,
+						reasonCode: reason,
 					},
 				});
-				return { type: "failed", message: validation.reason };
+				return { type: "failed", message: reason };
 			}
 			this._appendTraceSafely({
 				type: "context/save_state",
@@ -1403,15 +1988,15 @@ export class AgentSession {
 					samplesUsed: usage.samplesUsed,
 					consumedControlTokens: usage.controlTokens,
 					consumedOutputTokens: usage.outputTokens,
-					reasonCode: validation.reason,
+					reasonCode: reason,
 				},
 			});
 			this._controlReadTokens = Math.max(0, remainingControl);
 			const controlMessage = createCustomMessage(
 				"context-save-state-correction",
-				`The continuation contract is incomplete (${validation.reason}). Query exact sources if needed, then update next_action/current. ${SAVE_STATE_SUPERSESSION_INSTRUCTION} ${SAVE_STATE_CONTENT_INSTRUCTION} ${SAVE_STATE_MAX_SAMPLES - usage.samplesUsed} sampling attempt(s) remain.`,
+				`Context decision/save is incomplete (${reason}). ${SAVE_STATE_MAX_SAMPLES - usage.samplesUsed} sampling attempt(s) remain for the entire sequence. Finish here, or explicitly request new_context and save next_action/current after Todo synchronization. Batch independent calls and reuse visible results. Follow the continuation contract above. ${SAVE_STATE_SUPERSESSION_INSTRUCTION}`,
 				false,
-				{ operationId: operation.operationId, reason: validation.reason },
+				{ operationId: operation.operationId, reason },
 				new Date().toISOString(),
 			);
 			return {
@@ -1510,7 +2095,7 @@ export class AgentSession {
 				messages: [
 					createCustomMessage(
 						"context-recovery-required",
-						`Recovery is incomplete. Read the missing sourced bodies before business work: ${coverage.missing.slice(0, 8).join(", ")}. If an earlier page was removed from the final request, query it again with verify=true.`,
+						`Recovery is incomplete in the preceding provider request: ${coverage.missing.slice(0, 8).join(", ")}. The latest tool results may already contain these bodies; use those results instead of reading them again. Read only bodies still absent from the visible results. Once all required bodies are visible, acknowledge recovery without more reads; business tools will then be enabled. Use verify=true only when previously read content is absent from the current request.`,
 						false,
 						{ rolloverId: recovering.rolloverId, missing: coverage.missing },
 						new Date().toISOString(),
@@ -1529,6 +2114,8 @@ export class AgentSession {
 		}
 
 		if (this._pendingContextTransition()) {
+			const gate = this.getContextTransitionGate();
+			if (gate.status === "invalid") return { type: "failed", message: gate.reason };
 			const started = this._startSaveState(
 				this._latestRequest?.requestFingerprint ?? fingerprintContextRolloverValue(this.agent.state.messages),
 				"model_requested",
@@ -1554,7 +2141,7 @@ export class AgentSession {
 	 */
 	private _installContextGuard(): void {
 		this.agent.getContextBudgetOptions = () => ({});
-		this.agent.controlRequest = (budget, requestFingerprint) => {
+		this.agent.controlRequest = (budget, requestFingerprint, requestContext) => {
 			const { windowId } = this.sessionManager.ensureContextWindow();
 			const coordinates = this.sessionManager.getLatestContextCoordinates();
 			this._latestRequest = { budget, requestFingerprint };
@@ -1587,7 +2174,9 @@ export class AgentSession {
 				const usage = this._saveStateUsage(saveOperation.businessCutoffEntryId);
 				if (saveOperation.finished) {
 					const validation = validateContinuationState(this.sessionManager, saveOperation);
-					if (validation.status === "valid") return { type: "context_transition" };
+					if (validation.status === "valid" && this._pendingContextTransition())
+						return { type: "context_transition" };
+					if (validation.status === "valid") return { type: "failed", message: "model_request_missing" };
 					const remainingControlTokens = Math.max(0, saveOperation.controlBudgetTokens - usage.controlTokens);
 					const remainingOutputTokens = Math.max(0, saveOperation.outputBudgetTokens - usage.outputTokens);
 					if (
@@ -1639,7 +2228,7 @@ export class AgentSession {
 						requestConfigRevision: this._requestConfigFingerprint(),
 					},
 					this.settingsManager.getContextWorkThresholdPercent(),
-					"save_state",
+					this._pendingContextTransition() ? "save_state" : "decision",
 					remainingControlTokens,
 				);
 				if (budget.decision === "context_limit") return { type: "failed", message: "save_state_budget_exhausted" };
@@ -1655,11 +2244,20 @@ export class AgentSession {
 				},
 				this.settingsManager.getContextWorkThresholdPercent(),
 			);
-			if (this._completedRecoveryAwaitingBusinessRequest() && this._contextRemaining.phase !== "normal") {
-				return { type: "failed", message: "recovery_workset_too_large" };
+			if (this._completedRecoveryAwaitingBusinessRequest()) {
+				if (this._contextRemaining.phase !== "normal")
+					return { type: "failed", message: "recovery_workset_too_large" };
+				const rollover = [...this.sessionManager.getBranch()]
+					.reverse()
+					.find((entry) => entry.type === "context_rollover");
+				if (rollover?.type !== "context_rollover" || !validateCommittedRecovery(this.sessionManager, rollover))
+					return { type: "failed", message: "recovery_reference_invalid" };
+				const recovery = currentContextRecoveryReferences(this.sessionManager, rollover.recovery);
+				if (!contextRecoveryCoverage(this.sessionManager, requestContext.messages, recovery).complete)
+					return { type: "failed", message: "recovery_request_incomplete" };
 			}
 			if (!this.autoCompactionEnabled || this._contextRemaining.phase === "normal") return undefined;
-			return this._startSaveState(requestFingerprint);
+			return { type: "context_maintenance" };
 		};
 		this.agent.afterTurnControl = async (turn) => await this._afterContextControlTurn(turn);
 	}
@@ -1671,17 +2269,17 @@ export class AgentSession {
 			.getBranch()
 			.reverse()
 			.find(
-				(entry) =>
+				(entry): entry is Extract<SessionEntry, { type: "context_transition_request" }> =>
 					entry.type === "context_transition_request" &&
 					entry.windowId === windowId &&
 					entry.promptGeneration === promptGeneration,
 			);
 	}
 
-	private async _measureRequest() {
+	private async _measureRequest(messages = this.agent.state.messages, signal?: AbortSignal) {
 		const state = this.agent.state;
 		return await prepareAgentRequest(
-			{ systemPrompt: state.systemPrompt, tools: state.tools, messages: state.messages },
+			{ systemPrompt: state.systemPrompt, tools: state.tools, messages },
 			{
 				model: state.model,
 				reasoning: state.thinkingLevel === "off" ? undefined : state.thinkingLevel,
@@ -1690,8 +2288,10 @@ export class AgentSession {
 				transformContext: this.agent.transformContext,
 				appendOnlyContext: this.agent.appendOnlyContext,
 				getContextBudgetOptions: this.agent.getContextBudgetOptions,
+				prepareRequest: this.agent.prepareRequest,
 			},
-			undefined,
+			signal,
+			{ mode: "measure" },
 		);
 	}
 
@@ -1727,10 +2327,17 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const regions = collectShakeRegions(
 			entries,
-			{ ...resolved, keepBoundaryId: compactionEntry?.firstKeptEntryId },
+			{
+				...resolved,
+				protectedTools: [...resolved.protectedTools, ...CONTEXT_CONTROL_TOOLS],
+				keepBoundaryId: compactionEntry?.firstKeptEntryId,
+			},
 			collectShakenIndex(this.sessionManager.getBranch()),
 			estimateTokens,
-		);
+		).filter((region) => {
+			const entry = entries.find((candidate) => candidate.id === region.entryId);
+			return entry?.type === "message" && entry.message.role !== "user";
+		});
 		if (regions.length === 0) return { tokensSaved: 0, warnings: [] };
 
 		const historyAvailable =
@@ -1765,7 +2372,34 @@ export class AgentSession {
 	private _installAgentNextTurnRefresh(): void {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
-			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			let transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			if (transformed.some((message) => message.role === "compactionSummary")) {
+				const branch = this.sessionManager.getBranch();
+				const scope = resolveTaskNoteScope(
+					branch,
+					this.sessionManager.getLatestContextCoordinates().promptGeneration,
+				);
+				const notes = scope
+					? buildTaskNoteProjectionFromBranch(branch, scope, createTaskNoteFreshnessResolver(branch))
+					: undefined;
+				transformed = [
+					createCustomMessage(
+						"context-compaction-state",
+						`Current authoritative task state; summary text does not override requirements or Todo status.\n${JSON.stringify(
+							{
+								notes: notes?.status === "valid" ? notes.snapshot : null,
+								todos: this._todoStateStore
+									.toJSON()
+									.filter((todo) => todo.status === "pending" || todo.status === "in_progress"),
+							},
+						)}`,
+						false,
+						undefined,
+						"1970-01-01T00:00:00.000Z",
+					),
+					...transformed,
+				];
+			}
 			if (transformed.some((message) => message.role === "custom" && message.customType === "context-window"))
 				return transformed;
 			const { windowId } = this.sessionManager.ensureContextWindow();
@@ -1787,18 +2421,8 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			let refreshedTurn = turn;
-			if (
-				this.autoCompactionEnabled &&
-				turn.toolResults.length > 0 &&
-				estimateMessagesTokens(turn.context.messages) >=
-					(this.agent.state.model.contextWindow * this.settingsManager.getContextWorkThresholdPercent()) / 100
-			) {
-				if (this._commitShake(DEFAULT_SHAKE_CONFIG, "threshold").tokensSaved > 0)
-					refreshedTurn = { ...turn, context: { ...turn.context, messages: this.agent.state.messages } };
-			}
-			const previousSnapshot = await previousPrepareNextTurnWithContext?.(refreshedTurn, signal);
-			const previousContext = previousSnapshot?.context ?? refreshedTurn.context;
+			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
+			const previousContext = previousSnapshot?.context ?? turn.context;
 
 			return {
 				...previousSnapshot,
@@ -1810,6 +2434,308 @@ export class AgentSession {
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
+		};
+	}
+
+	getExecutionUpgradeState() {
+		const config = this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings();
+		return {
+			enabled: config.enabled,
+			current: {
+				targetModel: `${this.agent.state.model.provider}/${this.agent.state.model.id}`,
+				thinkingLevel: this.thinkingLevel,
+			},
+			metrics: this._executionMonitor.snapshot(),
+			options: executionUpgradeOptions(
+				this.agent.state.model,
+				this.thinkingLevel,
+				config,
+				this._modelRuntime.getAvailableSnapshot(),
+			),
+			lastUpgrade: this._lastExecutionUpgrade,
+		};
+	}
+
+	private _executionControlRequest(): boolean {
+		const identity = this.sessionManager.ensureContextWindow();
+		const coordinates = this.sessionManager.getLatestContextCoordinates();
+		const saving = getSaveStateOperation(this.sessionManager, identity.windowId, coordinates.promptGeneration);
+		return Boolean(this._recoveringRollover() || saving);
+	}
+
+	private _recordExecutionUpgrade(outcome: ExecutionUpgradeOutcome): void {
+		this._lastExecutionUpgrade = outcome;
+		if (outcome.status !== "applied") this.sessionManager.appendCustomEntry("execution-upgrade", outcome);
+		this._appendTraceSafely({
+			type: "execution/upgrade",
+			data: {
+				turn: this._traceTurn ?? Math.max(0, this._nextTraceTurn - 1),
+				step: this._traceStep,
+				sessionId: this.sessionId,
+				promptGeneration: this.sessionManager.getLatestContextCoordinates().promptGeneration,
+				outcome,
+			},
+		});
+		this._emit({ type: "execution_upgrade", outcome });
+		if (outcome.status !== "pending")
+			this._extensionUIContext?.notify(
+				`Execution upgrade ${outcome.status}: ${outcome.requested.targetModel} / ${outcome.requested.thinkingLevel}. ${outcome.message}`,
+				"info",
+			);
+	}
+
+	private _cancelExecutionUpgrade(message: string): void {
+		const pending = this._pendingExecutionUpgrade;
+		if (!pending) return;
+		this._pendingExecutionUpgrade = undefined;
+		this._recordExecutionUpgrade({ ...pending.outcome, status: "cancelled", message });
+	}
+
+	private _collectExecutionUpgrade(event: Extract<AgentEvent, { type: "turn_end" }>): void {
+		const requests = event.toolResults.flatMap((result) => {
+			const staged = this._executionToolRequests.get(result.toolCallId);
+			this._executionToolRequests.delete(result.toolCallId);
+			return staged && !result.isError ? [{ ...staged, callId: result.toolCallId }] : [];
+		});
+		if (requests.length === 0) return;
+		const first = requests[0];
+		const from: ExecutionProfile = {
+			targetModel: `${this.agent.state.model.provider}/${this.agent.state.model.id}`,
+			thinkingLevel: this.thinkingLevel,
+		};
+		const conflicting = requests.some(
+			({ request }) =>
+				request.targetModel !== first.request.targetModel || request.thinkingLevel !== first.request.thinkingLevel,
+		);
+		if (conflicting) {
+			for (const request of requests)
+				this._recordExecutionUpgrade({
+					callIds: [request.callId],
+					status: "rejected",
+					from,
+					requested: request.request,
+					message: "Conflicting targets in the same tool batch. Choose one target in a new call.",
+				});
+			return;
+		}
+		this._cancelExecutionUpgrade("Replaced by a later explicit upgrade request.");
+		const outcome: ExecutionUpgradeOutcome = {
+			callIds: requests.map(({ callId }) => callId),
+			status: "pending",
+			from,
+			requested: first.request,
+			message: "Waiting for validation of the next ordinary request.",
+		};
+		this._pendingExecutionUpgrade = { outcome, revision: first.revision };
+		this._recordExecutionUpgrade(outcome);
+		if (requests.some(({ revision }) => revision !== this._selectionRevision))
+			this._cancelExecutionUpgrade("User selection changed after the requesting model started.");
+	}
+
+	private _installExecutionUpgrade(): void {
+		const restoredEntry = this.sessionManager
+			.getBranch()
+			.reverse()
+			.find(
+				(entry) =>
+					(entry.type === "custom" && entry.customType === "execution-upgrade") ||
+					(entry.type === "model_change" && entry.executionUpgrade !== undefined),
+			);
+		const restored =
+			restoredEntry?.type === "model_change"
+				? restoredEntry.executionUpgrade
+				: restoredEntry?.type === "custom"
+					? (restoredEntry.data as ExecutionUpgradeOutcome)
+					: undefined;
+		if (restored) {
+			this._lastExecutionUpgrade = restored;
+			if (restored.status === "pending")
+				this._recordExecutionUpgrade({
+					...restored,
+					status: "cancelled",
+					message: "Session interrupted before upgrade commit; request was not replayed.",
+				});
+		}
+		const previousPrepare = this.agent.prepareRequest;
+		this.agent.prepareRequest = async (context, prepare, signal, mode) => {
+			if (mode !== "measure") this._preparedExecutionRevision = this._selectionRevision;
+			const previousRequest = await previousPrepare?.(context, prepare, signal, mode);
+			context = previousRequest?.context ?? context;
+			if (mode !== "measure" && this._executionControlRequest()) return previousRequest;
+			const config = this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings();
+			const active = config.enabled && context.tools?.some((tool) => tool.name === "upgrade_execution");
+			if (!active) {
+				if (mode !== "measure")
+					this._cancelExecutionUpgrade("Execution upgrades are disabled or the tool is unavailable.");
+				return previousRequest;
+			}
+			if (mode !== "measure") this._executionMonitor.observeTodos(this._todoStateStore.toJSON());
+			const state = this.getExecutionUpgradeState();
+			const reminder = state.options.length > 0 && this._executionMonitor.reminderDue(config);
+			const makeContext = (
+				current: ExecutionProfile,
+				outcome?: ExecutionUpgradeOutcome,
+				model = this.agent.state.model,
+			): Context => ({
+				...context,
+				messages: [
+					...context.messages,
+					{
+						role: "user",
+						content: [
+							"Execution status (runtime observations; you decide whether to call upgrade_execution):",
+							JSON.stringify({
+								current,
+								metrics: state.metrics,
+								lastUpgrade: outcome ?? this._lastExecutionUpgrade,
+								availableUpgrades: executionUpgradeOptions(
+									model,
+									current.thinkingLevel,
+									config,
+									this._modelRuntime.getAvailableSnapshot(),
+								),
+							}),
+							"Todo completions are agent-reported. No todos means no structured progress record. Tool success and tool counts do not prove progress or inability.",
+							...(reminder
+								? [
+										"Review whether your current approach is making progress. You may change approach, continue, or request stronger execution if useful. The runtime has not concluded that an upgrade is necessary.",
+									]
+								: []),
+						].join("\n"),
+						timestamp: 0,
+					},
+				],
+			});
+			if (mode === "measure") return await prepare({ context: makeContext(state.current) });
+			const pending = this._pendingExecutionUpgrade;
+			let prepared: PreparedAgentRequest | undefined;
+			let appliedUpgrade: { model: Model<string>; outcome: ExecutionUpgradeOutcome } | undefined;
+			if (pending) {
+				const { requested } = pending.outcome;
+				try {
+					if (pending.revision !== this._selectionRevision) throw new Error("User selection changed.");
+					const option = state.options.find((item) => item.targetModel === requested.targetModel);
+					if (!option?.thinkingLevels.includes(requested.thinkingLevel))
+						throw new Error("Target is not an allowed upgrade with a supported thinking level.");
+					const available = await this._modelRuntime.getAvailable();
+					const model = available.find((item) => `${item.provider}/${item.id}` === requested.targetModel);
+					if (!model) throw new Error("Target model is unavailable.");
+					if (!(await this._modelRuntime.checkAuth(model.provider)))
+						throw new Error("Target provider has no configured authentication.");
+					const applied: ExecutionUpgradeOutcome = {
+						...pending.outcome,
+						status: "applied",
+						message: "Selected for this request after validation.",
+					};
+					const candidate = await prepare({
+						model,
+						thinkingLevel: requested.thinkingLevel,
+						context: makeContext(requested, applied, model),
+					});
+					if (candidate.budget.decision === "context_limit")
+						throw new Error("The complete next request does not fit the target context window.");
+					if (
+						this.autoCompactionEnabled &&
+						contextRemaining(
+							candidate.budget,
+							{
+								windowId: this.sessionManager.ensureContextWindow().windowId,
+								measuredAtEntryId: this.sessionManager.getLeafId(),
+								requestConfigRevision: candidate.requestFingerprint,
+							},
+							this.settingsManager.getContextWorkThresholdPercent(),
+						).phase !== "normal"
+					)
+						throw new Error("The target has insufficient working context for this request.");
+					if (
+						!model.input.includes("image") &&
+						candidate.context.messages.some(
+							(message) =>
+								Array.isArray(message.content) && message.content.some((part) => part.type === "image"),
+						)
+					)
+						throw new Error("Target does not support images in the next request.");
+					signal?.throwIfAborted();
+					if (
+						this._promptAborted ||
+						this._selectionRevision !== pending.revision ||
+						this._pendingExecutionUpgrade !== pending ||
+						JSON.stringify(config) !==
+							JSON.stringify(
+								this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings(),
+							) ||
+						!this.getActiveToolNames().includes("upgrade_execution")
+					)
+						throw new Error("Upgrade cancelled by a user selection or cancellation.");
+					appliedUpgrade = {
+						model,
+						outcome: {
+							...applied,
+							requestFingerprint: candidate.requestFingerprint,
+							effectiveThinkingLevel: candidate.reasoning ?? "off",
+						},
+					};
+					prepared = candidate;
+				} catch (error) {
+					if (this._pendingExecutionUpgrade === pending) {
+						this._pendingExecutionUpgrade = undefined;
+						this._recordExecutionUpgrade({
+							...pending.outcome,
+							status:
+								signal?.aborted || this._promptAborted || pending.revision !== this._selectionRevision
+									? "cancelled"
+									: "rejected",
+							message: error instanceof Error ? error.message : String(error),
+						});
+					}
+					signal?.throwIfAborted();
+				}
+			}
+			if (appliedUpgrade) {
+				const { model, outcome } = appliedUpgrade;
+				const previousModel = this.agent.state.model;
+				const previousLevel = this.thinkingLevel;
+				// A single durable record commits the entire profile and its terminal status.
+				this.sessionManager.appendModelChange(model.provider, model.id, outcome);
+				this.agent.state.model = model;
+				this.agent.state.thinkingLevel = outcome.requested.thinkingLevel;
+				this._pendingExecutionUpgrade = undefined;
+				this._executionMonitor.resetObservation();
+				this._recordExecutionUpgrade(outcome);
+				this._emit({ type: "thinking_level_changed", level: outcome.requested.thinkingLevel });
+				void this._emitModelSelect(model, previousModel, "upgrade");
+				if (previousLevel !== outcome.requested.thinkingLevel)
+					void this._extensionRunner.emit({
+						type: "thinking_level_select",
+						level: outcome.requested.thinkingLevel,
+						previousLevel,
+					});
+			}
+			if (!prepared) this._preparedExecutionRevision = this._selectionRevision;
+			const unchangedModel = previousRequest?.model ?? this.agent.state.model;
+			const unchangedThinking = previousRequest ? (previousRequest.reasoning ?? "off") : this.thinkingLevel;
+			prepared ??= await prepare({
+				model: unchangedModel,
+				thinkingLevel: unchangedThinking,
+				context: makeContext(
+					{ targetModel: `${unchangedModel.provider}/${unchangedModel.id}`, thinkingLevel: unchangedThinking },
+					undefined,
+					unchangedModel,
+				),
+			});
+			this._appendTraceSafely({
+				type: "execution/status",
+				data: {
+					turn: this._traceTurn ?? Math.max(0, this._nextTraceTurn - 1),
+					step: this._traceStep,
+					sessionId: this.sessionId,
+					promptGeneration: this.sessionManager.getLatestContextCoordinates().promptGeneration,
+					metrics: state.metrics,
+					reminder,
+				},
+			});
+			if (reminder) this._executionMonitor.resetObservation();
+			return prepared;
 		};
 	}
 
@@ -1858,6 +2784,14 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
+		if (
+			this._deferredContextTransition &&
+			!this._promptAborted &&
+			this.getContextTransitionGate().status !== "busy"
+		) {
+			await this._resumePreparedContextRollover();
+			return;
+		}
 		try {
 			const state = this.agent.state.runState;
 			if (state.status === "idle" && state.lastOutcome?.type === "context_limit") {
@@ -1875,6 +2809,7 @@ export class AgentSession {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
+			this._settleCurrentMemoryRun();
 			this._resolveIdleWaitIfIdle();
 			this._scheduleDeferredContextTransition();
 		}
@@ -1886,8 +2821,7 @@ export class AgentSession {
 				!this._deferredContextTransition ||
 				this._isAgentRunActive ||
 				this._promptAborted ||
-				this._pendingInteractions.list().length > 0 ||
-				this._taskManager.list().some((task) => task.status === "running" || task.status === "cancelling")
+				this.getContextTransitionGate().status === "busy"
 			)
 				return;
 			void this._resumePreparedContextRollover().catch((error: unknown) => {
@@ -1911,7 +2845,7 @@ export class AgentSession {
 		});
 		if (!shouldFire) return false;
 		this._todoGateFireCount++;
-		void this._queueFollowUp(todoGateReminderText(), undefined);
+		void this._queueFollowUp(todoGateReminderText(), undefined, "runtime");
 		return true;
 	}
 
@@ -1989,6 +2923,7 @@ export class AgentSession {
 			"context_note",
 			"get_context_remaining",
 			"new_context",
+			"upgrade_execution",
 		];
 		const wanted =
 			mode === "read-only"
@@ -2043,7 +2978,13 @@ export class AgentSession {
 			const identity = this.sessionManager.ensureContextWindow();
 			const coordinates = this.sessionManager.getLatestContextCoordinates();
 			const saving = getSaveStateOperation(this.sessionManager, identity.windowId, coordinates.promptGeneration);
-			const phase = this._recoveringRollover() ? "recovering" : saving && !saving.finished ? "save_state" : "normal";
+			const phase = this._recoveringRollover()
+				? "recovering"
+				: saving && !saving.finished
+					? this._pendingContextTransition()
+						? "save_state"
+						: "decision"
+					: "normal";
 			this._contextRemaining = contextRemaining(
 				event.budget,
 				{
@@ -2197,6 +3138,21 @@ export class AgentSession {
 			message.details,
 			message.isError,
 		);
+		if (this._memoryRootPromptId) {
+			this._recordMemoryEvidence(this._memoryRootPromptId, {
+				sourceId: `${this._memoryRootPromptId}:tool:${message.toolCallId}`,
+				origin: "tool",
+				content: JSON.stringify({
+					toolName: message.toolName,
+					content: message.content,
+					details: message.details,
+					isError: message.isError,
+				}),
+				visibility: "session",
+				entryId: sourceEntryId,
+				toolCallId: message.toolCallId,
+			});
+		}
 		const batchSize = this._toolBatchSizeByCallId.get(message.toolCallId) ?? 1;
 		const phaseTokens =
 			this._contextRemaining?.phase === "normal"
@@ -2217,7 +3173,17 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "agent_end" && !this._willRetryAfterAgentEnd(event))
+			this._cancelExecutionUpgrade("Execution ended before an ordinary request could commit the upgrade.");
 		this._recordTraceEvent(event);
+		if (event.type === "request_start") {
+			this._executionBusinessRequest = !this._executionControlRequest();
+			this._executionRequestRevision = this._preparedExecutionRevision;
+		}
+		if (this._executionBusinessRequest) {
+			this._executionMonitor.observe(event);
+			if (event.type === "turn_end") this._collectExecutionUpgrade(event);
+		}
 		if (event.type === "request_start") {
 			this._lastProviderRequest = event.context;
 		} else if (event.type === "tool_execution_start") {
@@ -2233,6 +3199,18 @@ export class AgentSession {
 
 		if (event.type === "queue_delivery") {
 			for (const item of event.items) {
+				if (this._memoryRootPromptId && (item.message.role === "user" || item.message.role === "custom")) {
+					this._recordMemoryEvidence(this._memoryRootPromptId, {
+						sourceId: `${this._memoryRootPromptId}:queue:${item.queueItemId}`,
+						origin:
+							item.message.role === "custom"
+								? "extension"
+								: (this._memoryQueueOrigins.get(item.queueItemId) ?? "user"),
+						content: JSON.stringify(item.message.content),
+						visibility: "session",
+					});
+				}
+				this._memoryQueueOrigins.delete(item.queueItemId);
 				if (
 					this._rolloverDispatchPreparationId === undefined ||
 					event.preparationId !== this._rolloverDispatchPreparationId
@@ -2273,6 +3251,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			let persistedEntryId: string | undefined;
 			const deliveredFromQueue = this._deliveredPendingMessages.has(event.message as object);
 			if (deliveredFromQueue) this._deliveredPendingMessages.delete(event.message as object);
 			// Check if this is a custom message from extensions
@@ -2280,7 +3259,7 @@ export class AgentSession {
 				// The receipt projects the authoritative pending message into context.
 			} else if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
+				persistedEntryId = this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
 					event.message.content,
 					event.message.display,
@@ -2292,9 +3271,46 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				persistedEntryId = this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			if (
+				persistedEntryId &&
+				event.message.role === "user" &&
+				this._memoryRootPromptId &&
+				this._memoryRootSourceId &&
+				this._memoryRootSourceContent !== undefined
+			) {
+				this.sessionManager.appendMemoryEvidence({
+					evidenceEventId: this._memoryRootSourceId,
+					rootPromptId: this._memoryRootPromptId,
+					origin: "user",
+					content: this._memoryRootSourceContent,
+					visibility: "session",
+					deliveryState: "delivered",
+					sourceEntryId: persistedEntryId,
+				});
+				this._memoryAuthority.bindEvidenceSourceEntry(
+					this._memoryRootPromptId,
+					this._memoryRootSourceId,
+					persistedEntryId,
+				);
+				this._memoryRootSourceId = undefined;
+				this._memoryRootSourceContent = undefined;
+			}
+			if (
+				persistedEntryId &&
+				this._memoryRootPromptId &&
+				(event.message.role === "assistant" || event.message.role === "custom")
+			) {
+				this._recordMemoryEvidence(this._memoryRootPromptId, {
+					sourceId: `${this._memoryRootPromptId}:message:${this._memoryEvidenceSequence++}`,
+					origin: event.message.role === "assistant" ? "assistant" : "extension",
+					content: JSON.stringify(event.message.content),
+					visibility: "session",
+					entryId: persistedEntryId,
+				});
+			}
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -2478,6 +3494,10 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
+		this._disposed = true;
+		if (this._memoryArchiveRetryTimer) clearTimeout(this._memoryArchiveRetryTimer);
+		this._memoryArchiveRetryTimer = undefined;
+		this._memoryArchiveService?.cancelCurrent();
 		const cleanups = [
 			() => this.abortRetry(),
 			() => this.abortCompaction(),
@@ -2531,6 +3551,36 @@ export class AgentSession {
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
 		return !this._isAgentRunActive;
+	}
+
+	/** One gate for commit, resume, deferred scheduling and headless lifecycle. */
+	getContextTransitionGate(retainedRequiredIds: readonly string[] = []): ContextTransitionGate {
+		if (
+			this._pendingInteractions.list().length > 0 ||
+			this._taskManager
+				.list()
+				.some((task) => task.kind !== "subagent" && (task.status === "running" || task.status === "cancelling"))
+		)
+			return { status: "busy" };
+		const branch = this.sessionManager.getBranch();
+		const window = [...branch]
+			.reverse()
+			.find((entry) => entry.type === "context_window" || entry.type === "context_rollover");
+		const windowIndex = window ? branch.indexOf(window) : -1;
+		try {
+			collectCompleteToolTransactions(branch.slice(windowIndex + 1));
+		} catch {
+			return { status: "busy" };
+		}
+		try {
+			const scope = resolveTaskNoteScope(branch, this.sessionManager.getLatestContextCoordinates().promptGeneration);
+			return {
+				status: "ready",
+				...captureSubagentHandoff(this.sessionManager, scope, this._taskManager.list(), retainedRequiredIds),
+			};
+		} catch {
+			return { status: "invalid", reason: "subagent_handoff_invalid" };
+		}
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -2729,6 +3779,72 @@ export class AgentSession {
 		}
 	}
 
+	private async _maintainContext(overflow: boolean): Promise<PostRunAction> {
+		const maintenance = new ContextMaintenance(this.sessionManager);
+		if (this.agent.state.messages.at(-1)?.role === "assistant") {
+			this._appendContextControlMessage(
+				createCustomMessage(
+					"context-maintenance-start",
+					"The provider rejected the context size. Context maintenance is preparing a smaller request.",
+					false,
+					undefined,
+					new Date().toISOString(),
+				),
+			);
+		}
+		while (!this._promptAborted) {
+			const tokensBefore = this._latestRequest?.budget.tokens ?? Number.POSITIVE_INFINITY;
+			const step = maintenance.next(this._requestConfigFingerprint());
+			if (step.stage === "decision") {
+				const started = this._startSaveState(
+					this._latestRequest?.requestFingerprint ?? fingerprintContextRolloverValue(this.agent.state.messages),
+					overflow ? "provider_context_rejected" : "work_budget_reached",
+				);
+				if (started.type === "failed") {
+					this.agent.setIdleOutcome(started);
+					return "stop";
+				}
+				maintenance.begin(step);
+				this._appendContextControlMessage(started.message);
+				return "continue_save_state";
+			}
+			maintenance.begin(step);
+			if (step.stage === "shake") this._commitShake(DEFAULT_SHAKE_CONFIG, "threshold");
+			else {
+				try {
+					await this._compactContext(overflow ? "overflow" : "threshold");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (
+						this._promptAborted ||
+						message === "Compaction cancelled" ||
+						(error instanceof Error && error.name === "AbortError")
+					) {
+						this.agent.setIdleOutcome({ type: "aborted", message });
+						return "stop";
+					}
+					if (message === "Compaction source changed" || message === "Invalid or stale compaction result")
+						return "continue";
+				}
+			}
+			if (this._promptAborted) break;
+			const request = await this._measureRequest();
+			this._latestRequest = request;
+			this._contextRemaining = contextRemaining(
+				request.budget,
+				{
+					windowId: this.sessionManager.ensureContextWindow().windowId,
+					measuredAtEntryId: this.sessionManager.getLeafId(),
+					requestConfigRevision: this._requestConfigFingerprint(),
+				},
+				this.settingsManager.getContextWorkThresholdPercent(),
+			);
+			if (this._contextRemaining.phase === "normal" && (!overflow || request.budget.tokens < tokensBefore))
+				return "continue";
+		}
+		return "stop";
+	}
+
 	private async _handlePostAgentRun(): Promise<PostRunAction> {
 		while (true) {
 			const msg = this._lastAssistantMessage;
@@ -2751,20 +3867,25 @@ export class AgentSession {
 			);
 			if (outcome === "failed" && activeSaveOperation && !activeSaveOperation.finished) return "stop";
 			if (
-				requested ||
-				(this.autoCompactionEnabled &&
-					(outcome === "context_limit" || outcome === "context_transition" || overflow))
+				!requested &&
+				!activeSaveOperation &&
+				this.autoCompactionEnabled &&
+				(outcome === "context_maintenance" || outcome === "context_limit" || overflow)
 			) {
+				return await this._maintainContext(overflow === true);
+			}
+			if (requested) {
+				const gate = this.getContextTransitionGate();
+				if (gate.status === "invalid") {
+					this._deferredContextTransition = false;
+					this.agent.setIdleOutcome({ type: "failed", message: gate.reason });
+					return "stop";
+				}
 				const saveOperation = activeSaveOperation;
 				if (!saveOperation) {
-					const transitionCause: ContextTransitionCause = requested
-						? "model_requested"
-						: overflow
-							? "provider_context_rejected"
-							: "work_budget_reached";
 					const started = this._startSaveState(
 						this._latestRequest?.requestFingerprint ?? fingerprintContextRolloverValue(this.agent.state.messages),
-						transitionCause,
+						"model_requested",
 					);
 					if (started.type === "failed") {
 						this._extensionUIContext?.notify(started.message, "error");
@@ -2778,13 +3899,11 @@ export class AgentSession {
 				if (!request || this.agent.state.messages.at(-1)?.role !== "assistant")
 					request = await this._measureRequest();
 				if (!request) return "stop";
-				const cause = saveOperation.transitionCause;
 				const { windowId } = currentWindow;
 				const result = await this._contextRollover.run({
-					cause,
+					cause: "model_requested",
 					windowId,
-					requestId:
-						requested?.type === "context_transition_request" ? requested.requestId : `${windowId}:${cause}`,
+					requestId: requested.requestId,
 					budget: request.budget,
 					requestFingerprint: request.requestFingerprint,
 				});
@@ -2814,6 +3933,7 @@ export class AgentSession {
 				this._retryAttempt = 0;
 			}
 			if (outcome === "failed") return "stop";
+			if (activeSaveOperation) return "wait";
 			if (this.agent.hasQueuedMessages()) return "continue";
 			return this._maybeTriggerTodoGate() ? "continue" : "wait";
 		}
@@ -2833,6 +3953,7 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		let startedMemoryRun = false;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -2881,9 +4002,17 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(
+						expandedText,
+						currentImages,
+						options?.source === "extension" ? "extension" : "user",
+					);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(
+						expandedText,
+						currentImages,
+						options?.source === "extension" ? "extension" : "user",
+					);
 				}
 				preflightResult?.(true);
 				return;
@@ -2911,6 +4040,8 @@ export class AgentSession {
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}
+			this._startMemoryRun(text, currentText, expandedText);
+			startedMemoryRun = this._memoryArchiveService !== undefined;
 			const rolloverState = this.sessionManager.getContextRolloverState();
 			if (
 				rolloverState.dispatchState === "outcome_unknown" &&
@@ -3004,6 +4135,7 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		} catch (error) {
+			if (startedMemoryRun) this._settleCurrentMemoryRun("failed");
 			preflightResult?.(false);
 			throw error;
 		}
@@ -3120,7 +4252,11 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		origin: "user" | "runtime" | "extension" = "user",
+	): Promise<void> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3130,6 +4266,7 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		this._memoryQueueOrigins.set(queued.queueItemId, origin);
 		this.agent.steer(queued);
 		this._emitQueueUpdate();
 	}
@@ -3137,7 +4274,11 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		origin: "user" | "runtime" | "extension" = "user",
+	): Promise<void> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3147,6 +4288,7 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		this._memoryQueueOrigins.set(queued.queueItemId, origin);
 		this.agent.followUp(queued);
 		this._emitQueueUpdate();
 	}
@@ -3273,7 +4415,10 @@ export class AgentSession {
 		const followUp = queueItems
 			.filter((item) => item.channel === "follow_up")
 			.map((item) => messageText(item.message));
-		for (const item of queueItems) this._pendingDeliveryStore.cancel(item.queueItemId);
+		for (const item of queueItems) {
+			this._pendingDeliveryStore.cancel(item.queueItemId);
+			this._memoryQueueOrigins.delete(item.queueItemId);
+		}
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -3311,6 +4456,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this._promptAborted = true;
+		this._cancelExecutionUpgrade("User cancelled execution.");
 		this.abortCompaction();
 		this.abortRetry();
 		this.agent.abort();
@@ -3318,6 +4464,13 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
+		if (
+			!this._isAgentRunActive &&
+			this._deferredContextTransition &&
+			!this._promptAborted &&
+			this.getContextTransitionGate().status !== "busy"
+		)
+			await this._resumePreparedContextRollover();
 		if (this.isIdle) {
 			return;
 		}
@@ -3331,7 +4484,7 @@ export class AgentSession {
 	private async _emitModelSelect(
 		nextModel: Model<any>,
 		previousModel: Model<any> | undefined,
-		source: "set" | "cycle" | "restore",
+		source: "set" | "cycle" | "restore" | "upgrade",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
 		await this._extensionRunner.emit({
@@ -3348,6 +4501,8 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>): Promise<void> {
+		this._selectionRevision++;
+		this._cancelExecutionUpgrade("User selected a model.");
 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
@@ -3371,6 +4526,8 @@ export class AgentSession {
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
+		this._selectionRevision++;
+		this._cancelExecutionUpgrade("User cycled the model.");
 		if (this._scopedModels.length > 0) {
 			return this._cycleScopedModel(direction);
 		}
@@ -3447,6 +4604,8 @@ export class AgentSession {
 	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
+		this._selectionRevision++;
+		this._cancelExecutionUpgrade("User selected a thinking level.");
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -3555,8 +4714,19 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
+		try {
+			return await this._compactContext("manual", customInstructions);
+		} finally {
+			this._reconnectToAgent();
+		}
+	}
+
+	private async _compactContext(
+		reason: "manual" | "threshold" | "overflow",
+		customInstructions?: string,
+	): Promise<CompactionResult> {
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		this._emit({ type: "compaction_start", reason });
 
 		try {
 			if (!this.model) {
@@ -3568,6 +4738,7 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
 			const sourceFingerprint = fingerprintContextRolloverValue(pathEntries);
+			const sourceRevisions = fingerprintContextRolloverValue(this._contextRolloverRevisions());
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -3588,7 +4759,7 @@ export class AgentSession {
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
-					reason: "manual",
+					reason,
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -3629,7 +4800,7 @@ export class AgentSession {
 					this.agent.streamFunction,
 					env,
 					this.settingsManager.getRetrySettings(),
-					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+					this._summarizationRetryCallbacks({ source: "compaction", reason }),
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -3645,6 +4816,54 @@ export class AgentSession {
 			if (this._validateCompactionCommit(summary, firstKeptEntryId, sourceFingerprint) !== "valid") {
 				throw new Error("Invalid or stale compaction result");
 			}
+			const scope = resolveTaskNoteScope(
+				pathEntries,
+				this.sessionManager.getLatestContextCoordinates().promptGeneration,
+			);
+			const users = new History(this.sessionManager).getItems().filter((item) => item.role === "user");
+			const taskIndex = users.findIndex((item) => createTaskScopeId(item.entryId) === scope?.taskScopeId);
+			const preservedEntryIds = taskIndex < 0 ? [] : users.slice(taskIndex).map((item) => item.entryId);
+			const requiredDeliveries = new Set(
+				pathEntries.flatMap((entry) =>
+					entry.type === "pending_delivery" && preservedEntryIds.includes(entry.id) ? [entry.deliveryId] : [],
+				),
+			);
+			preservedEntryIds.push(
+				...pathEntries.flatMap((entry) =>
+					entry.type === "delivery_receipt" && requiredDeliveries.has(entry.deliveryId) ? [entry.id] : [],
+				),
+			);
+			if (reason !== "manual") {
+				const candidate: CompactionEntry = {
+					...this.sessionManager.ensureContextWindow(),
+					type: "compaction",
+					id: randomUUID(),
+					parentId: this.sessionManager.getLeafId(),
+					timestamp: "1970-01-01T00:00:00.000Z",
+					summary,
+					firstKeptEntryId,
+					preservedEntryIds,
+					tokensBefore,
+					details,
+					usage,
+					fromHook: fromExtension,
+				};
+				const candidateMessages = buildSessionContext(
+					[...this.sessionManager.getEntries(), candidate],
+					candidate.id,
+				).messages;
+				const before = await this._measureRequest(
+					this.agent.state.messages,
+					this._compactionAbortController.signal,
+				);
+				const after = await this._measureRequest(candidateMessages, this._compactionAbortController.signal);
+				if (after.budget.tokens >= before.budget.tokens)
+					throw new Error("Compaction did not reduce the complete request");
+				if (sourceRevisions !== fingerprintContextRolloverValue(this._contextRolloverRevisions()))
+					throw new Error("Compaction source changed");
+				this._compactionAbortController.signal.throwIfAborted();
+				if (this._promptAborted) throw new Error("Compaction cancelled");
+			}
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -3652,6 +4871,7 @@ export class AgentSession {
 				details,
 				fromExtension,
 				usage,
+				preservedEntryIds,
 			);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -3680,7 +4900,7 @@ export class AgentSession {
 					type: "session_compact",
 					compactionEntry: savedCompactionEntry,
 					fromExtension,
-					reason: "manual",
+					reason,
 					willRetry: false,
 				});
 			}
@@ -3695,19 +4915,18 @@ export class AgentSession {
 			};
 			this._emit({
 				type: "compaction_end",
-				reason: "manual",
+				reason,
 				result: compactionResult,
 				aborted: false,
 				willRetry: false,
 			});
-			if (this.settingsManager.getMemorySettings().enabled) this._writeCompactionNote(summary, compactionId);
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
 			this._emit({
 				type: "compaction_end",
-				reason: "manual",
+				reason,
 				result: undefined,
 				aborted,
 				willRetry: false,
@@ -3716,7 +4935,6 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
-			this._reconnectToAgent();
 		}
 	}
 
@@ -3735,6 +4953,10 @@ export class AgentSession {
 	}
 
 	private _beginContextPrompt(): void {
+		this._cancelExecutionUpgrade("A new user prompt started.");
+		this._executionMonitor = new ExecutionMonitor();
+		this._executionMonitor.observeTodos(this._todoStateStore.toJSON());
+		this._executionToolRequests.clear();
 		this._deferredContextTransition = false;
 		this._latestRequest = undefined;
 		this._contextRemaining = undefined;
@@ -3811,38 +5033,6 @@ export class AgentSession {
 		};
 	}
 
-	/** A note is created only after its compaction boundary has been committed. */
-	private _writeCompactionNote(summary: string, compactionId: string): boolean {
-		try {
-			const note = this._memoryStore.writeSessionNote(
-				this._cwd,
-				this.sessionName ?? "session",
-				this.sessionId,
-				summary,
-				compactionId,
-			);
-			this._appendTraceSafely({
-				type: "memory/archive",
-				data: {
-					turn: Math.max(0, this._nextTraceTurn - 1),
-					compactionId,
-					ran: note.written > 0,
-					reason: note.written ? "note_written" : "note_rejected",
-					written: note.written,
-					skipped: note.skipped,
-					reasons: note.reasons,
-				},
-			});
-			return note.written > 0;
-		} catch {
-			this._appendTraceSafely({
-				type: "memory/archive",
-				data: { turn: Math.max(0, this._nextTraceTurn - 1), compactionId, ran: false, reason: "note_write_failed" },
-			});
-			return false;
-		}
-	}
-
 	/**
 	 * Toggle auto-compaction setting.
 	 */
@@ -3892,7 +5082,10 @@ export class AgentSession {
 		if (this._isAgentRunActive) return;
 		const state = this.contextRolloverState;
 		const resumableDispatch = this._resumableInterruptedDispatch();
-		const interrupted = state.outcome === "context_limit" || state.outcome === "context_transition";
+		const interrupted =
+			state.outcome === "context_limit" ||
+			state.outcome === "context_transition" ||
+			state.outcome === "context_maintenance";
 		const identity = this.sessionManager.ensureContextWindow();
 		const coordinates = this.sessionManager.getLatestContextCoordinates();
 		const saving = getSaveStateOperation(this.sessionManager, identity.windowId, coordinates.promptGeneration);
@@ -3911,7 +5104,11 @@ export class AgentSession {
 		try {
 			if (saving && !saving.finished) {
 				const usage = this._saveStateUsage(saving.businessCutoffEntryId);
-				const validation = validateContinuationState(this.sessionManager, saving);
+				const savedValidation = validateContinuationState(this.sessionManager, saving);
+				const validation: ContinuationStateValidation =
+					savedValidation.status === "valid" && !this._pendingContextTransition()
+						? { status: "invalid", reason: "model_request_missing" }
+						: savedValidation;
 				if (validation.status === "valid") {
 					this._finishSaveState(saving, usage, validation);
 					this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
@@ -4395,7 +5592,10 @@ export class AgentSession {
 					taskManager: this._taskManager,
 					todoWrite: {
 						store: this._todoStateStore,
-						onChange: (snapshot) => this.sessionManager.appendCustomEntry("todo-state", snapshot),
+						onChange: (snapshot) => {
+							this.sessionManager.appendCustomEntry("todo-state", snapshot);
+							if (this._executionBusinessRequest) this._executionMonitor.observeTodos(snapshot);
+						},
 					},
 				});
 		Object.assign(baseToolDefinitions, {
@@ -4420,10 +5620,25 @@ export class AgentSession {
 				onTrace: (event) => this._appendTraceSafely(event),
 			}),
 		});
-		if (this.settingsManager.getMemorySettings().enabled) {
+		if ((this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings()).enabled) {
 			Object.assign(baseToolDefinitions, {
-				memory_search: createMemorySearchToolDefinition(this._memoryStore, this._cwd),
-				memory_get: createMemoryGetToolDefinition(this._memoryStore),
+				upgrade_execution: createUpgradeExecutionToolDefinition((callId, request) => {
+					this._executionToolRequests.set(callId, {
+						request: structuredClone(request),
+						revision: this._executionRequestRevision,
+					});
+				}),
+			});
+		}
+		if (this.settingsManager.getMemorySettings().enabled) {
+			const memoryQueryContext = () => ({
+				cwd: this._cwd,
+				platform: process.platform,
+				runtime: process.version,
+			});
+			Object.assign(baseToolDefinitions, {
+				memory_search: createMemorySearchToolDefinition(this._memoryAuthority, memoryQueryContext),
+				memory_get: createMemoryGetToolDefinition(this._memoryAuthority, memoryQueryContext),
 			});
 		}
 		if (this._lspEnabled) {
@@ -4475,8 +5690,26 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "history", "context_note", "get_context_remaining", "new_context"];
+			: [
+					"read",
+					"bash",
+					"edit",
+					"write",
+					"todo_write",
+					"task",
+					"get_task_output",
+					"kill_task",
+					"history",
+					"context_note",
+					"get_context_remaining",
+					"new_context",
+				];
+		if (!this._baseToolsOverride && this.settingsManager.getMemorySettings().enabled) {
+			defaultActiveToolNames.push("memory_search", "memory_get");
+		}
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
+		if (options.activeToolNames === undefined && "upgrade_execution" in baseToolDefinitions)
+			baseActiveToolNames.push("upgrade_execution");
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,

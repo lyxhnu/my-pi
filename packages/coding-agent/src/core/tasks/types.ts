@@ -1,5 +1,6 @@
 /** Long-running work tracked by one TaskManager. */
 export type TaskKind = "bash" | "subagent" | "diagnostics" | "lsp";
+export type TaskArchiveRole = "dependency" | "service";
 
 export type TaskStatus = "running" | "cancelling" | "completed" | "blocked" | "failed" | "cancelled";
 
@@ -8,6 +9,7 @@ interface TaskSnapshotBase {
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
+	archiveRole: TaskArchiveRole;
 	parentTaskId?: string;
 	cwd?: string;
 	/** Redacted, human-readable description (never the raw unredacted command/prompt). */
@@ -26,6 +28,7 @@ export type TaskSnapshot<TResult = unknown> = TaskSnapshotBase &
 	);
 
 export interface TaskRunContext {
+	taskId: string;
 	signal: AbortSignal;
 	/** Append a chunk of output while the run is active. */
 	appendOutput: (chunk: string) => void;
@@ -39,6 +42,7 @@ export interface TaskStartRequest<TResult = unknown> {
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
+	archiveRole?: TaskArchiveRole;
 	parentTaskId?: string;
 	cwd?: string;
 	description: string;
@@ -67,6 +71,9 @@ export interface TaskWaitResult {
 export interface TaskStateTransition {
 	taskId: string;
 	kind: TaskKind;
+	ownerSessionId?: string;
+	rootPromptId?: string;
+	archiveRole: TaskArchiveRole;
 	from?: TaskStatus;
 	to: TaskStatus;
 	reason?: string;

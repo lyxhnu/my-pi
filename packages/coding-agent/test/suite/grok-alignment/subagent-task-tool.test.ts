@@ -32,14 +32,16 @@ describe("task (subagent) tool", () => {
 		};
 	}
 
-	it("is registered but inactive by default at depth 0, alongside get_task_output/kill_task", async () => {
+	it("is registered and active by default at depth 0, alongside get_task_output/kill_task", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const allToolNames = harness.session.getAllTools().map((tool) => tool.name);
 		expect(allToolNames).toContain("task");
 		expect(allToolNames).toContain("get_task_output");
 		expect(allToolNames).toContain("kill_task");
-		expect(harness.session.getActiveToolNames()).not.toContain("task");
+		expect(harness.session.getActiveToolNames()).toEqual(
+			expect.arrayContaining(["task", "get_task_output", "kill_task"]),
+		);
 	});
 
 	it("is physically removed (with get_task_output/kill_task) once MAX_SUBAGENT_DEPTH is reached", async () => {
@@ -52,52 +54,69 @@ describe("task (subagent) tool", () => {
 		expect(harness.session.getActiveToolNames()).not.toContain("task");
 	});
 
-	it("runs a foreground explore subagent to a structured result", async () => {
-		const harness = await createTaskHarness();
-		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage(
-				fauxToolCall("task", {
-					description: "look around",
-					prompt: "find the entry point",
-					subagent_type: "explore",
-					run_in_background: false,
-				}),
-				{ stopReason: "toolUse" },
-			),
-			// Consumed by the CHILD subagent's own single-turn conversation (shared faux response queue).
-			fauxAssistantMessage(fauxToolCall("submit_subagent_result", completedSubmission("child found index.ts")), {
-				stopReason: "toolUse",
-			}),
-			// Consumed by the parent once the tool result comes back.
-			fauxAssistantMessage("done"),
-		]);
-		await harness.session.prompt("investigate the repo");
+	it.each(["completed", "blocked"] as const)(
+		"returns a foreground %s result with a model-visible task ID",
+		async (status) => {
+			const harness = await createTaskHarness();
+			harnesses.push(harness);
+			let parentResultText = "";
+			harness.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("task", {
+						description: "look around",
+						prompt: "find the entry point",
+						subagent_type: "explore",
+						run_in_background: false,
+					}),
+					{ stopReason: "toolUse" },
+				),
+				// Consumed by the CHILD subagent's own single-turn conversation (shared faux response queue).
+				fauxAssistantMessage(
+					fauxToolCall(
+						"submit_subagent_result",
+						status === "completed"
+							? completedSubmission("child found index.ts")
+							: { status, summary: "child found index.ts", blocker: "missing dependency", findings: [] },
+					),
+					{ stopReason: "toolUse" },
+				),
+				// Consumed by the parent once the tool result comes back.
+				(context) => {
+					const result = context.messages.find(
+						(message) => message.role === "toolResult" && message.toolName === "task",
+					);
+					parentResultText = getMessageText(result);
+					return fauxAssistantMessage("done");
+				},
+			]);
+			await harness.session.prompt("investigate the repo");
 
-		const toolResult = harness.session.messages.filter((m) => m.role === "toolResult").pop();
-		expect(toolResult?.role).toBe("toolResult");
-		const text = getMessageText(toolResult);
-		expect(text).not.toContain("<subagent_meta>");
-		expect(text).toContain('"agentType":"explore"');
-		expect(text).toContain('"capabilityMode":"read-only"');
-		expect(text).toContain('"summary":"child found index.ts"');
-		if (toolResult?.role === "toolResult") {
-			expect(toolResult.isError).not.toBe(true);
-			const details = toolResult.details as { result?: unknown };
-			expect(isSubagentTaskResult(details.result)).toBe(true);
-		}
+			const toolResult = harness.session.messages.filter((m) => m.role === "toolResult").pop();
+			expect(toolResult?.role).toBe("toolResult");
+			const text = getMessageText(toolResult);
+			expect(text).not.toContain("<subagent_meta>");
+			expect(text).toContain('"agentType":"explore"');
+			expect(text).toContain('"capabilityMode":"read-only"');
+			expect(text).toContain('"summary":"child found index.ts"');
+			if (toolResult?.role === "toolResult") {
+				expect(toolResult.isError).not.toBe(true);
+				const details = toolResult.details as { result?: unknown };
+				expect(isSubagentTaskResult(details.result)).toBe(true);
+			}
 
-		const subagentTasks = harness.session.taskManager.list().filter((t) => t.kind === "subagent");
-		expect(subagentTasks).toHaveLength(1);
-		expect(subagentTasks[0]?.status).toBe("completed");
-		const taskStateEvents = harness.sessionManager
-			.getEntries()
-			.filter((entry) => entry.type === "trace" && entry.event.type === "task/state")
-			.map((entry) =>
-				entry.type === "trace" && entry.event.type === "task/state" ? entry.event.data.to : undefined,
-			);
-		expect(taskStateEvents).toEqual(["running", "completed"]);
-	});
+			const subagentTasks = harness.session.taskManager.list().filter((t) => t.kind === "subagent");
+			expect(subagentTasks).toHaveLength(1);
+			expect(subagentTasks[0]?.status).toBe(status);
+			expect(JSON.parse(parentResultText)).toMatchObject({ taskId: subagentTasks[0]?.taskId });
+			const taskStateEvents = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "trace" && entry.event.type === "task/state")
+				.map((entry) =>
+					entry.type === "trace" && entry.event.type === "task/state" ? entry.event.data.to : undefined,
+				);
+			expect(taskStateEvents).toEqual(["running", status]);
+		},
+	);
 
 	it("runs a background general-purpose subagent that is pollable via get_task_output", async () => {
 		const harness = await createTaskHarness();

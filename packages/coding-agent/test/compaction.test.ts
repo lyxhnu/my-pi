@@ -382,9 +382,8 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + kept (u2, a2) + after (u3, a3) = 5
-		expect(loaded.messages.length).toBe(6);
-		expect(loaded.messages[1].role).toBe("compactionSummary");
-		expect((loaded.messages[1] as any).summary).toContain("Summary of 1,a,2,b");
+		expect(loaded.messages.length).toBe(5);
+		expect(loaded.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Summary of 1,a,2,b" });
 	});
 
 	it("should handle multiple compactions (only latest matters)", () => {
@@ -406,8 +405,8 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + kept from u3 (u3, c) + after (u4, d) = 5
-		expect(loaded.messages.length).toBe(6);
-		expect((loaded.messages[1] as any).summary).toContain("Second summary");
+		expect(loaded.messages.length).toBe(5);
+		expect(loaded.messages[0]).toMatchObject({ role: "compactionSummary", summary: "Second summary" });
 	});
 
 	it("should keep all messages when firstKeptEntryId is first entry", () => {
@@ -421,7 +420,7 @@ describe("buildSessionContext", () => {
 
 		const loaded = buildSessionContext(entries);
 		// summary + all messages (u1, a1, u2, b) = 5
-		expect(loaded.messages.length).toBe(6);
+		expect(loaded.messages.length).toBe(5);
 	});
 
 	it("should track model and thinking level changes", () => {
@@ -567,8 +566,7 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 
 		// Should have summary + kept messages
 		expect(reloaded.messages.length).toBeLessThan(loaded.messages.length);
-		expect(reloaded.messages[1].role).toBe("compactionSummary");
-		expect((reloaded.messages[1] as any).summary).toContain(compactionResult.summary);
+		expect(reloaded.messages[0]).toMatchObject({ role: "compactionSummary", summary: compactionResult.summary });
 
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);

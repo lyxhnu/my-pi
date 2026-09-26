@@ -234,6 +234,7 @@ describe("warehouse continuation acceptance", () => {
 							requiredHistoryRefs: [failureRef],
 							requirementSourceRefs: [taskRef],
 							todoIds: [],
+							subagentContinuations: [],
 						},
 					}),
 					{ stopReason: "toolUse" },

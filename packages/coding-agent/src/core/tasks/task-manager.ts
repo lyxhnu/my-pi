@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { TaskOutputBuffer } from "./task-output-buffer.ts";
 import type {
+	TaskArchiveRole,
 	TaskKind,
 	TaskOutputPage,
 	TaskSnapshot,
@@ -16,6 +17,7 @@ interface TaskRecordBase {
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
+	archiveRole: TaskArchiveRole;
 	parentTaskId?: string;
 	cwd?: string;
 	description: string;
@@ -47,6 +49,7 @@ function toSnapshot(record: TaskRecord): TaskSnapshot {
 		kind: record.kind,
 		ownerSessionId: record.ownerSessionId,
 		rootPromptId: record.rootPromptId,
+		archiveRole: record.archiveRole,
 		parentTaskId: record.parentTaskId,
 		cwd: record.cwd,
 		description: record.description,
@@ -116,6 +119,7 @@ function missingTask(taskId: string): TaskSnapshot {
 	return {
 		taskId,
 		kind: "bash",
+		archiveRole: "dependency",
 		description: "",
 		status: "failed",
 		startedAt: now,
@@ -128,9 +132,17 @@ function missingTask(taskId: string): TaskSnapshot {
 export class TaskManager {
 	private tasks = new Map<string, TaskRecord>();
 	private readonly onTransition?: (transition: TaskStateTransition) => void;
+	private readonly resolveOwnership?: () => { ownerSessionId?: string; rootPromptId?: string };
+	private readonly onOutput?: (taskId: string, chunk: string) => void;
 
-	constructor(onTransition?: (transition: TaskStateTransition) => void) {
+	constructor(
+		onTransition?: (transition: TaskStateTransition) => void,
+		resolveOwnership?: () => { ownerSessionId?: string; rootPromptId?: string },
+		onOutput?: (taskId: string, chunk: string) => void,
+	) {
 		this.onTransition = onTransition;
+		this.resolveOwnership = resolveOwnership;
+		this.onOutput = onOutput;
 	}
 
 	private storeTransition(previous: TaskRecord, next: TaskRecord): void {
@@ -139,6 +151,9 @@ export class TaskManager {
 		this.onTransition?.({
 			taskId: next.taskId,
 			kind: next.kind,
+			ownerSessionId: next.ownerSessionId,
+			rootPromptId: next.rootPromptId,
+			archiveRole: next.archiveRole,
 			from: previous.status,
 			to: next.status,
 			...(next.status === "cancelling"
@@ -151,6 +166,7 @@ export class TaskManager {
 
 	start<TResult>(request: TaskStartRequest<TResult>): TaskSnapshot<TResult> {
 		const taskId = randomUUID();
+		const ownership = this.resolveOwnership?.() ?? {};
 		const abortController = new AbortController();
 		const buffer = new TaskOutputBuffer();
 		let resolveSettled = () => {};
@@ -160,8 +176,9 @@ export class TaskManager {
 		const record: TaskRecord = {
 			taskId,
 			kind: request.kind,
-			ownerSessionId: request.ownerSessionId,
-			rootPromptId: request.rootPromptId,
+			ownerSessionId: request.ownerSessionId ?? ownership.ownerSessionId,
+			rootPromptId: request.rootPromptId ?? ownership.rootPromptId,
+			archiveRole: request.archiveRole ?? (request.kind === "lsp" ? "service" : "dependency"),
 			parentTaskId: request.parentTaskId,
 			cwd: request.cwd,
 			description: request.description,
@@ -172,13 +189,24 @@ export class TaskManager {
 			settled,
 		};
 		this.tasks.set(taskId, record);
-		this.onTransition?.({ taskId, kind: request.kind, to: "running" });
+		this.onTransition?.({
+			taskId,
+			kind: request.kind,
+			ownerSessionId: record.ownerSessionId,
+			rootPromptId: record.rootPromptId,
+			archiveRole: record.archiveRole,
+			to: "running",
+		});
 
 		const ctx = {
+			taskId,
 			signal: abortController.signal,
 			appendOutput: (chunk: string) => {
 				const current = this.tasks.get(taskId);
-				if (current && isActive(current)) current.buffer.append(chunk);
+				if (current && isActive(current)) {
+					this.onOutput?.(taskId, chunk);
+					current.buffer.append(chunk);
+				}
 			},
 		};
 

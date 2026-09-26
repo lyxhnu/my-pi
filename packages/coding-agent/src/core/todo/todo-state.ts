@@ -67,6 +67,11 @@ export class TodoStateStore {
 		this.todos.clear();
 	}
 
+	/** Publish an already persisted candidate without changing this store's identity. */
+	replaceWith(candidate: TodoStateStore): void {
+		this.todos = new Map(candidate.entries().map(([id, item]) => [id, { ...item }]));
+	}
+
 	/** Snapshot for session persistence (custom entry payload). */
 	toJSON(): Array<{ id: string } & TodoItem> {
 		return this.entries().map(([id, item]) => ({ id, ...item }));

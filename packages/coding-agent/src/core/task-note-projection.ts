@@ -27,6 +27,7 @@ export interface NextActionResume {
 	requiredHistoryRefs: TaskNoteReference[];
 	requirementSourceRefs: TaskNoteReference[];
 	todoIds: string[];
+	subagentContinuations: Array<{ taskId: string; parentRelation: string; onResult: string }>;
 }
 
 export type TaskNoteCandidate =
@@ -177,7 +178,7 @@ function validReference(value: unknown): value is TaskNoteReference {
 		keys.every((key) => key === "entryId" || key === "blockIndex") &&
 		typeof reference.entryId === "string" &&
 		reference.entryId.length > 0 &&
-		(reference.blockIndex === undefined || (Number.isInteger(reference.blockIndex) && reference.blockIndex >= 0))
+		(reference.blockIndex === undefined || (Number.isInteger(reference.blockIndex) && reference.blockIndex >= -1))
 	);
 }
 
@@ -196,18 +197,41 @@ function validResume(value: unknown, kind: TaskNoteKind, key: string): value is 
 	const resume = value as Partial<NextActionResume>;
 	if (
 		!Object.keys(value).every((name) =>
-			["relatedNotes", "requiredHistoryRefs", "requirementSourceRefs", "todoIds"].includes(name),
+			["relatedNotes", "requiredHistoryRefs", "requirementSourceRefs", "todoIds", "subagentContinuations"].includes(
+				name,
+			),
 		) ||
 		!Array.isArray(resume.relatedNotes) ||
 		!Array.isArray(resume.requiredHistoryRefs) ||
 		!Array.isArray(resume.requirementSourceRefs) ||
 		!Array.isArray(resume.todoIds) ||
+		!Array.isArray(resume.subagentContinuations) ||
 		[
 			resume.relatedNotes.length,
 			resume.requiredHistoryRefs.length,
 			resume.requirementSourceRefs.length,
 			resume.todoIds.length,
 		].some((length) => length > MAX_TASK_NOTE_RESUME_REFS)
+	)
+		return false;
+	if (
+		!resume.subagentContinuations.every(
+			(item) =>
+				item !== null &&
+				typeof item === "object" &&
+				Object.keys(item).length === 3 &&
+				typeof item.taskId === "string" &&
+				item.taskId.length > 0 &&
+				item.taskId.length <= 128 &&
+				[item.parentRelation, item.onResult].every(
+					(text) =>
+						typeof text === "string" &&
+						text.trim().length > 0 &&
+						text.length <= MAX_TASK_NOTE_TEXT_CHARS &&
+						!containsPotentialSecret(text),
+				),
+		) ||
+		new Set(resume.subagentContinuations.map((item) => item.taskId)).size !== resume.subagentContinuations.length
 	)
 		return false;
 	const related = resume.relatedNotes;
@@ -544,13 +568,18 @@ function eventToCandidate(event: TaskNoteEvent): TaskNoteCandidate {
 
 function referenceBlockIsValid(entry: SessionEntry, blockIndex: number | undefined): boolean {
 	if (blockIndex === undefined) return true;
+	if (entry.type === "custom" && entry.customType === "todo-state") return blockIndex === -1;
 	if (entry.type === "tool_result_source") return entry.content[blockIndex]?.type === "text";
 	if (entry.type === "message") {
-		if (!("content" in entry.message) || typeof entry.message.content === "string") return false;
+		if (entry.message.role === "bashExecution") return blockIndex === -1 && !entry.message.excludeFromContext;
+		if (entry.message.role === "branchSummary" || entry.message.role === "compactionSummary")
+			return blockIndex === -1;
+		if (!("content" in entry.message)) return false;
+		if (typeof entry.message.content === "string") return blockIndex === -1;
 		return entry.message.content[blockIndex]?.type === "text";
 	}
 	if (entry.type === "custom_message") {
-		if (typeof entry.content === "string") return false;
+		if (typeof entry.content === "string") return blockIndex === -1;
 		return entry.content[blockIndex]?.type === "text";
 	}
 	return false;
@@ -586,6 +615,7 @@ function isClaimSource(entry: SessionEntry): boolean {
 	return (
 		entry.type === "message" ||
 		entry.type === "context_progress" ||
+		(entry.type === "custom" && entry.customType === "todo-state") ||
 		(entry.type === "custom_message" && entry.customType === "user-provenance")
 	);
 }

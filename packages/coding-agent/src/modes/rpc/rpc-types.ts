@@ -7,9 +7,10 @@
 
 import type { AgentMessage, AgentRunPhase, AgentRunState, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { AgentSession, MemoryFlushResult, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { MemoryArchiveStatus } from "../../core/memory/types.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -46,9 +47,11 @@ export type RpcCommand =
 	| { id?: string; type: "compact"; customInstructions?: string }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
 
-	// Memory (spec 10.5/10.6: manual /memory flush + /memory undo)
-	| { id?: string; type: "memory_flush"; customInstructions?: string }
-	| { id?: string; type: "memory_undo"; scope: "global" | "project"; entryId: string }
+	// Project memory authority
+	| { id?: string; type: "memory_remember"; text: string }
+	| { id?: string; type: "memory_flush" }
+	| { id?: string; type: "memory_status" }
+	| { id?: string; type: "memory_undo"; memoryId: string }
 
 	// Retry
 	| { id?: string; type: "set_auto_retry"; enabled: boolean }
@@ -108,6 +111,7 @@ export type RpcAgentRunState =
 	  };
 
 export interface RpcSessionState {
+	executionUpgrade: ReturnType<AgentSession["getExecutionUpgradeState"]>;
 	runState: RpcAgentRunState;
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
@@ -198,10 +202,18 @@ export type RpcResponse =
 	| {
 			id?: string;
 			type: "response";
+			command: "memory_remember";
+			success: true;
+			data: { memoryId: string; revision: number };
+	  }
+	| {
+			id?: string;
+			type: "response";
 			command: "memory_flush";
 			success: true;
-			data: { attempted: boolean; written: number; skipped: number; reasons: string[]; warning?: string };
+			data: MemoryFlushResult;
 	  }
+	| { id?: string; type: "response"; command: "memory_status"; success: true; data: MemoryArchiveStatus }
 	| { id?: string; type: "response"; command: "memory_undo"; success: true; data: { undone: boolean } }
 
 	// Retry

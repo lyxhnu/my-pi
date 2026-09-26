@@ -218,11 +218,28 @@ describe("TaskNoteProjection", () => {
 			requiredHistoryRefs: [],
 			requirementSourceRefs: [{ entryId: user.id }],
 			todoIds: [],
+			subagentContinuations: [],
 		};
 		const accepted = acceptTaskNoteCandidate({ ...base, resume }, context);
 		if (accepted.status !== "accepted") throw new Error("Expected the continuation contract to be accepted");
 		const projection = buildTaskNoteProjection({ events: [accepted.event], scope });
 		expect(projection.status === "valid" ? projection.snapshot.items[0].resume : undefined).toEqual(resume);
+		const child = {
+			taskId: "child",
+			parentRelation: "Parent needs the scoped result.",
+			onResult: "Verify the range, then write the final output.",
+		};
+		for (const subagentContinuations of [
+			[child, child],
+			[{ ...child, parentRelation: " " }],
+			[{ ...child, onResult: "" }],
+			[{ ...child, onResult: "x".repeat(2001) }],
+		]) {
+			expect(acceptTaskNoteCandidate({ ...base, resume: { ...resume, subagentContinuations } }, context)).toEqual({
+				status: "rejected",
+				reason: "invalid_output",
+			});
+		}
 	});
 
 	it("persists a context_note as session metadata without echoing its text", async () => {
