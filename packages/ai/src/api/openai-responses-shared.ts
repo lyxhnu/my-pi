@@ -705,6 +705,9 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
+			// Close the iterator/request at the protocol terminal event. Some gateways
+			// keep the SSE connection open after the response has already completed.
+			break;
 		} else if (event.type === "error") {
 			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {

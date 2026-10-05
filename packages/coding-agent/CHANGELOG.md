@@ -4,9 +4,10 @@
 
 ### Breaking Changes
 
+- Replace worker-based subagents and deadline/review/replace/takeover controls with persistent in-process child sessions and seven collaboration tools. Permission tiers constrain tool capabilities; cancellation confirms agents and tracked tools, not arbitrary external process trees.
 - Require `resume.subagentContinuations` on `next_action/current` and persist branch-verifiable subagent references with rollover recovery contracts.
 - Removed `history_get`, automatic-compaction policy/checkpoint exports, and `compactModel`, `strictCompactModel`, `twoPassEnabled`, `wallClockBudgetSecs`, and `memoryFlushEnabled` settings. Use `history` and the window tools; handle `context_transition` as incomplete.
-- Set the default active model tool set to `read`, `bash`, `edit`, `write`, and session-scoped `history`, `context_note`, `get_context_remaining`, and `new_context`. Other built-ins must be selected explicitly; memory and LSP tools are registered only when configured.
+- Set the default active model tool set to `read`, `bash`, `edit`, `write`, `todo_write`, `get_task_output`, `kill_task`, and session-scoped `history`, `context_note`, `get_context_remaining`, and `new_context`. Persistent CLI/SDK roots also enable `spawn_agent`, `followup_task`, `send_message`, `list_agents`, `get_agent_info`, `wait_agent`, and `interrupt_agent`; memory and LSP tools are registered only when configured.
 - Replaced unreachable background task states with an explicit `running`/`cancelling`/terminal state machine; `TaskManager.wait()` now reports its own deadline separately from task status.
 - Replaced Markdown-backed active memory and compaction-triggered consolidation with project-scoped v2 authority records. `memory_get` now accepts a memory ID, and RPC/TUI memory operations use remember/status/flush/undo against revisioned records. Existing Markdown and dream-state files remain historical data and are not auto-imported.
 - Added `runState` to RPC `get_state` and `reasons` to memory-flush results. Consumers must handle `context_limit` as non-completion.
@@ -14,6 +15,7 @@
 
 ### Added
 
+- Added root-wide limits of 8 lifetime child identities and 3 executing child runs, FIFO followups, causal cancellation, cycle-checked waits, bounded mail and paginated results, and exclusive root/child session ownership.
 - Added opt-in agent-owned execution upgrades, factual progress observations, review reminders, independent child upgrades, atomic profile persistence, and RPC/trace diagnostics.
 - Added stable context-window identities, bounded state saving, minimal recovery references, prepared dispatch, durable queue receipts, and crash recovery without replaying unknown outcomes.
 - Added branch-scoped Task Note updates and bounded queries with evidence freshness; cumulative audit events no longer invalidate the active projection.
@@ -28,7 +30,7 @@
 - Added an optional vector recall channel to `memory_search`: configure `memory.embedding.{baseUrl,model,apiKeyEnv}` (OpenAI-compatible `/embeddings` endpoint, key read from the named env var) and semantic hits are fused with keyword scores; unconfigured setups keep the exact keyword-only behavior. Vectors are cached in `.memory-index.json` sidecars and refreshed lazily per search.
 - Added three-tier age degradation for session notes, exposed through the Memory store: notes older than 30 days are truncated to 800 chars, older than 180 days reduced to heading/list key signal (300 chars), with search downweighting tiers at 1/0.85/0.7. Curated MEMORY.md is never degraded.
 - Added durable log-only execution traces for turn/step boundaries, final request headers, assistant stream chunks, and tool execution, plus `/trace` for inspecting them in the interactive CLI without adding trace nodes to `/tree`.
-- Added validated `submit_subagent_result` completion for built-in subagents, with structured findings, changes, verification, and blockers returned through foreground and background task results; task state transitions are recorded in the creating turn's trace.
+- Added child-context reuse across explicit followups and session reopening without replaying interrupted or queued work; each execution retains its own run ID and final response.
 
 ### Changed
 
@@ -37,15 +39,17 @@
 
 ### Fixed
 
-- Allow delegated subagents to remain running or cancelling across context rollover while preserving tool-batch, budget and provenance checks. Restore delegation instructions and parent result-handling plans before business requests, and keep print/json sessions alive through continuation.
-- Include task IDs in model-visible foreground subagent results so completed and blocked delegations can be referenced in continuation notes.
+- Keep the current owned session usable when resumed or imported again, recognize Windows path aliases, and release destination ownership after a rejected cwd change.
+- Keep subagent runs stopping until tracked cleanup settles, reject stale run callbacks, and retain uncertain external-effect facts after completion or interruption.
+- Allow delegated subagents to remain running or stopping across context rollover while preserving tool-batch, budget and provenance checks. Restore delegation instructions and parent result-handling plans before business requests, and keep print/json sessions alive through continuation.
+- Bind subagent continuation notes to the original run ID and real spawn/followup source, so a reused child's later result cannot replace an earlier delegation.
 - Fixed real-model memory extraction schema drift, assistant-source coverage gaps, stale archive failure status, scoped-rule false negatives, short RPC command timeouts, and first-write `context_note` schema friction found by restart-level Agent testing.
 - Fixed split-turn summary inheritance, invalid-summary commits, stale usage anchors, revoked vector/read results, and secret-filter bypasses through note/archive inputs.
 - Fixed context-limit handling across CLI, RPC and subagents; reduction is bounded, rechecks the actual request, and does not replay tools or duplicate queued user messages.
 - Fixed rollover recovery to include all unfinished Todo even when omitted from model-selected dependencies, and persist Todo updates before publishing them in memory. CLI failures before the first assistant response now return a nonzero exit code.
 - Fixed `context_note` to accept History's whole-text references, including Todo snapshots, and clarified bounded saving and recovery prompts after real-model testing.
 - Restricted lossy note aging to successfully processed snapshots and preserved their processed identity across aging.
-- Fixed Windows path containment and memory path construction, bounded UTF-8 task/tool output, transactional subagent worktree application, deterministic LSP/MCP shutdown, and the reminder master switch.
+- Fixed Windows path containment and memory path construction, bounded UTF-8 task/tool output, deterministic LSP/MCP shutdown, and the reminder master switch.
 - Fixed compaction and branch summaries for providers whose authentication resolves entirely to request headers ([#5871](https://github.com/earendil-works/pi/issues/5871))
 
 ## [0.82.0] - 2026-07-24

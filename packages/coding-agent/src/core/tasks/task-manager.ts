@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { SubagentRunScope } from "../subagents/run-scope.ts";
 import { TaskOutputBuffer } from "./task-output-buffer.ts";
 import type {
 	TaskArchiveRole,
@@ -17,6 +18,7 @@ interface TaskRecordBase {
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
+	runId?: string;
 	archiveRole: TaskArchiveRole;
 	parentTaskId?: string;
 	cwd?: string;
@@ -49,6 +51,7 @@ function toSnapshot(record: TaskRecord): TaskSnapshot {
 		kind: record.kind,
 		ownerSessionId: record.ownerSessionId,
 		rootPromptId: record.rootPromptId,
+		runId: record.runId,
 		archiveRole: record.archiveRole,
 		parentTaskId: record.parentTaskId,
 		cwd: record.cwd,
@@ -134,15 +137,18 @@ export class TaskManager {
 	private readonly onTransition?: (transition: TaskStateTransition) => void;
 	private readonly resolveOwnership?: () => { ownerSessionId?: string; rootPromptId?: string };
 	private readonly onOutput?: (taskId: string, chunk: string) => void;
+	private readonly runScope?: SubagentRunScope;
 
 	constructor(
 		onTransition?: (transition: TaskStateTransition) => void,
 		resolveOwnership?: () => { ownerSessionId?: string; rootPromptId?: string },
 		onOutput?: (taskId: string, chunk: string) => void,
+		runScope?: SubagentRunScope,
 	) {
 		this.onTransition = onTransition;
 		this.resolveOwnership = resolveOwnership;
 		this.onOutput = onOutput;
+		this.runScope = runScope;
 	}
 
 	private storeTransition(previous: TaskRecord, next: TaskRecord): void {
@@ -153,6 +159,7 @@ export class TaskManager {
 			kind: next.kind,
 			ownerSessionId: next.ownerSessionId,
 			rootPromptId: next.rootPromptId,
+			runId: next.runId,
 			archiveRole: next.archiveRole,
 			from: previous.status,
 			to: next.status,
@@ -165,7 +172,9 @@ export class TaskManager {
 	}
 
 	start<TResult>(request: TaskStartRequest<TResult>): TaskSnapshot<TResult> {
-		const taskId = randomUUID();
+		const lease = this.runScope?.assertActive();
+		const taskId = request.taskId ?? randomUUID();
+		if (this.tasks.has(taskId)) throw new Error("task_id_already_registered");
 		const ownership = this.resolveOwnership?.() ?? {};
 		const abortController = new AbortController();
 		const buffer = new TaskOutputBuffer();
@@ -178,6 +187,7 @@ export class TaskManager {
 			kind: request.kind,
 			ownerSessionId: request.ownerSessionId ?? ownership.ownerSessionId,
 			rootPromptId: request.rootPromptId ?? ownership.rootPromptId,
+			runId: lease?.runId,
 			archiveRole: request.archiveRole ?? (request.kind === "lsp" ? "service" : "dependency"),
 			parentTaskId: request.parentTaskId,
 			cwd: request.cwd,
@@ -189,17 +199,28 @@ export class TaskManager {
 			settled,
 		};
 		this.tasks.set(taskId, record);
-		this.onTransition?.({
-			taskId,
-			kind: request.kind,
-			ownerSessionId: record.ownerSessionId,
-			rootPromptId: record.rootPromptId,
-			archiveRole: record.archiveRole,
-			to: "running",
-		});
+		try {
+			this.onTransition?.({
+				taskId,
+				kind: request.kind,
+				ownerSessionId: record.ownerSessionId,
+				rootPromptId: record.rootPromptId,
+				runId: record.runId,
+				archiveRole: record.archiveRole,
+				to: "running",
+			});
+		} catch (error) {
+			this.tasks.delete(taskId);
+			resolveSettled();
+			throw error;
+		}
+		const abort = () => this.cancel(taskId, "owning run cancelled");
+		lease?.signal.addEventListener("abort", abort, { once: true });
+		if (lease?.signal.aborted) abort();
 
 		const ctx = {
 			taskId,
+			runId: lease?.runId,
 			signal: abortController.signal,
 			appendOutput: (chunk: string) => {
 				const current = this.tasks.get(taskId);
@@ -212,7 +233,10 @@ export class TaskManager {
 
 		Promise.resolve()
 			.then(() => {
-				if (!abortController.signal.aborted) return request.run(ctx);
+				if (!abortController.signal.aborted) {
+					this.runScope?.assertActive();
+					return request.run(ctx);
+				}
 				const current = this.tasks.get(taskId);
 				if (current) {
 					this.storeTransition(
@@ -255,7 +279,10 @@ export class TaskManager {
 					),
 				);
 			})
-			.finally(resolveSettled);
+			.finally(() => {
+				lease?.signal.removeEventListener("abort", abort);
+				resolveSettled();
+			});
 
 		return toSnapshot(record) as TaskSnapshot<TResult>;
 	}
@@ -263,6 +290,11 @@ export class TaskManager {
 	get(taskId: string): TaskSnapshot | undefined {
 		const record = this.tasks.get(taskId);
 		return record ? toSnapshot(record) : undefined;
+	}
+
+	setCwd(taskId: string, cwd: string): void {
+		const record = this.tasks.get(taskId);
+		if (record && isActive(record)) record.cwd = cwd;
 	}
 
 	async awaitSettled(taskId: string): Promise<TaskSnapshot> {
@@ -280,6 +312,7 @@ export class TaskManager {
 	}
 
 	async wait(taskIds: string[], options?: TaskWaitOptions): Promise<TaskWaitResult> {
+		options?.signal?.throwIfAborted();
 		const records = taskIds
 			.map((id) => this.tasks.get(id))
 			.filter((record): record is TaskRecord => record !== undefined);
@@ -288,14 +321,24 @@ export class TaskManager {
 		let timedOut = false;
 		if (timeoutMs > 0 && pending.length > 0) {
 			let timeout: ReturnType<typeof setTimeout> | undefined;
-			const winner = await Promise.race([
-				Promise.all(pending.map((record) => record.settled)).then(() => "settled" as const),
-				new Promise<"timeout">((resolve) => {
-					timeout = setTimeout(() => resolve("timeout"), timeoutMs);
-				}),
-			]);
-			if (timeout) clearTimeout(timeout);
-			timedOut = winner === "timeout";
+			let abort: (() => void) | undefined;
+			try {
+				const winner = await Promise.race([
+					Promise.all(pending.map((record) => record.settled)).then(() => "settled" as const),
+					new Promise<"timeout">((resolve) => {
+						timeout = setTimeout(() => resolve("timeout"), timeoutMs);
+					}),
+					new Promise<never>((_resolve, reject) => {
+						abort = () => reject(options?.signal?.reason ?? new Error("cancelled"));
+						options?.signal?.addEventListener("abort", abort, { once: true });
+						if (options?.signal?.aborted) abort();
+					}),
+				]);
+				timedOut = winner === "timeout";
+			} finally {
+				if (timeout) clearTimeout(timeout);
+				if (abort) options?.signal?.removeEventListener("abort", abort);
+			}
 		}
 		return { snapshots: taskIds.map((id) => this.get(id) ?? missingTask(id)), timedOut };
 	}

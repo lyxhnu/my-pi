@@ -272,14 +272,16 @@ export {
 	type SkillFrontmatter,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
+export { withSubagentToolPermission } from "./core/subagents/permissions.ts";
+export type { RootSubagentOptions } from "./core/subagents/root-session.ts";
 export {
-	type BlockedSubagentSubmission,
-	type CompletedSubagentSubmission,
-	isSubagentTaskResult,
-	type SubagentSubmission,
-	type SubagentTaskResult,
-	subagentSubmissionSchema,
-} from "./core/subagents/protocol.ts";
+	SUBAGENT_LIMITS,
+	SubagentError,
+	type SubagentIdentity,
+	type SubagentPermission,
+	type SubagentPermissionMode,
+	type SubagentRun,
+} from "./core/subagents/types.ts";
 export { queryTaskNotes, type TaskNoteQuery } from "./core/task-note-query.ts";
 export { TaskManager } from "./core/tasks/task-manager.ts";
 export type {

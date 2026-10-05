@@ -226,7 +226,7 @@ export function currentContextRecoveryReferences(
 		{ ...recovery, subagentNoteEventId: recovery.requiredTaskIds.length > 0 ? nextAction.eventId : null },
 		nextAction,
 	);
-	const handoff = captureSubagentHandoff(manager, scope, [], recovery.requiredTaskIds);
+	const handoff = captureSubagentHandoff(manager, scope, recovery.requiredTaskIds);
 	const related = nextAction.resume.relatedNotes.map((reference) =>
 		projection.snapshot.items.find((item) => item.kind === reference.kind && item.key === reference.key),
 	);

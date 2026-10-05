@@ -45,6 +45,13 @@ export const PLAN_MODE_READ_ONLY_TOOLS = [
 	"new_context",
 	"context_note",
 	"upgrade_execution",
+	"spawn_agent",
+	"followup_task",
+	"send_message",
+	"list_agents",
+	"get_agent_info",
+	"wait_agent",
+	"interrupt_agent",
 ];
 
 export function buildPlanArtifact(input: {

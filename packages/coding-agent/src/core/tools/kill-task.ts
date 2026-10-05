@@ -15,7 +15,7 @@ export function createKillTaskToolDefinition(taskManager: TaskManager): ToolDefi
 		name: "kill_task",
 		label: "kill_task",
 		description:
-			"Cancel a background task (background bash command or subagent) started earlier. " +
+			"Cancel a background task (command or diagnostics job) started earlier. " +
 			"Cancelling a parent task also cancels any tasks it spawned.",
 		promptSnippet: "Cancel a background task by id",
 		parameters: killTaskSchema,
@@ -32,7 +32,12 @@ export function createKillTaskToolDefinition(taskManager: TaskManager): ToolDefi
 			}
 			const after = taskManager.cancel(task_id, "cancelled by kill_task");
 			return {
-				content: [{ type: "text", text: `Killed task ${task_id} (status: ${after?.status ?? "unknown"}).` }],
+				content: [
+					{
+						type: "text",
+						text: `Cancellation requested for task ${task_id} (status: ${after?.status ?? "unknown"}).`,
+					},
+				],
 				details: undefined,
 			};
 		},

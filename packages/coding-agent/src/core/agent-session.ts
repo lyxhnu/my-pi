@@ -57,7 +57,6 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
-import { BUILTIN_SUBAGENT_PROMPTS } from "../builtin-agents/index.ts";
 import { getMemoryDir } from "../config.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
@@ -165,7 +164,6 @@ import {
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { SandboxManager } from "./sandbox/sandbox-manager.ts";
-import { resolveSandboxSettings, type SandboxProfileName } from "./sandbox/types.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -187,12 +185,10 @@ import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type ContextTransitionGate, captureSubagentHandoff } from "./subagent-continuation.ts";
-import { runPiChildAgent } from "./subagents/pi-child-runner.ts";
-import {
-	MAX_SUBAGENT_DEPTH,
-	type SubagentChildRequest,
-	SubagentCoordinator,
-} from "./subagents/subagent-coordinator.ts";
+import { canUseSubagentTool, subagentToolPermission } from "./subagents/permissions.ts";
+import type { RootSubagentSession } from "./subagents/root-session.ts";
+import type { SubagentRunScope } from "./subagents/run-scope.ts";
+import { SubagentError, type SubagentPermission } from "./subagents/types.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import {
 	buildTaskNoteProjectionFromBranch,
@@ -221,7 +217,6 @@ import { createMcpUseToolDefinition } from "./tools/mcp-use-tool.ts";
 import { createMemoryGetToolDefinition } from "./tools/memory-get.ts";
 import { createMemorySearchToolDefinition } from "./tools/memory-search.ts";
 import { createEnterPlanModeToolDefinition, createExitPlanModeToolDefinition } from "./tools/plan-mode.ts";
-import { createTaskToolDefinition } from "./tools/task.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { boundToolResultContent } from "./tools/tool-result-budget.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./tools/truncate.ts";
@@ -335,6 +330,11 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	subagentRoot?: RootSubagentSession;
+	/** The root coordinator owns every model turn in this child session. */
+	subagentRunScope?: SubagentRunScope;
+	subagentPermission?: () => SubagentPermission;
+	collaborationTools?: ToolDefinition[];
 	/** A child captures the parent's upgrade policy at spawn time. */
 	executionUpgrade?: ExecutionUpgradeConfig;
 	agent: Agent;
@@ -368,8 +368,6 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** File path for the permission-decision audit log (JSONL). When omitted, permission decisions are evaluated but not persisted to disk. */
 	permissionAuditLogPath?: string;
-	/** Depth of *this* session in the subagent tree. 0 = root/user-facing session, 1 = a spawned subagent. Subagents at MAX_SUBAGENT_DEPTH cannot spawn further subagents: task/get_task_output/kill_task are physically removed from their tool registry. Default: 0. */
-	subagentDepth?: number;
 	/** Root directory for the Grok-aligned memory system (memory_search/memory_get + compaction memory flush). Default: getMemoryDir() (~/.pi/agent/memory). Tests should override this to a tmpdir. */
 	memoryRootDir?: string;
 	/** Deterministic archive extractor injection. Production uses the configured model with no tools. */
@@ -378,13 +376,6 @@ export interface AgentSessionConfig {
 	lspServers?: LspServerConfig[];
 	/** MCP server configs. search_tool/use_tool only register when this is non-empty (Grok two-stage discovery, spec 13). */
 	mcpServers?: McpServerConfig[];
-	/**
-	 * Forces this session's own bash tool through SandboxManager with the given profile (spec 12).
-	 * Used by SubagentCoordinator to bind a subagent's capability_mode to a sandbox profile
-	 * ("read-only" capability_mode -> "read-only" sandbox profile; anything else -> "workspace").
-	 * Root/user-facing sessions leave this unset (bash stays unsandboxed, unchanged default behavior).
-	 */
-	sandboxProfileOverride?: SandboxProfileName;
 	/** Search backend for web_search. The tool is not registered when omitted. */
 	webSearchOperations?: WebSearchOperations;
 	/** Overrides the default (real, fetch()-backed) web_fetch backend. */
@@ -504,6 +495,10 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	private readonly _subagentRunScope?: SubagentRunScope;
+	private readonly _subagentPermission?: () => SubagentPermission;
+	private readonly _collaborationTools: ToolDefinition[];
+	readonly subagents?: RootSubagentSession;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -559,8 +554,6 @@ export class AgentSession {
 	private _todoGateFireCount = 0;
 	private _planModeState: PlanModeState = OFF_PLAN_MODE_STATE;
 	private _pendingInteractions!: PendingInteractionRegistry;
-	private _subagentDepth = 0;
-	private _subagentCoordinator!: SubagentCoordinator;
 	private _memoryStore!: MemoryStore;
 	private _memoryAuthority!: MemoryAuthority;
 	private _memoryArchiveService: MemoryArchiveService | undefined;
@@ -580,7 +573,6 @@ export class AgentSession {
 	private _mcpManager!: McpManager;
 	private _webFetchOps!: WebFetchOperations;
 	private _webSearchOps: WebSearchOperations | undefined;
-	private _sandboxProfileOverride: SandboxProfileName | undefined;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -614,8 +606,15 @@ export class AgentSession {
 	private _systemPromptOverride?: string;
 
 	constructor(config: AgentSessionConfig) {
+		const ownership = config.sessionManager.getHeader()?.ownership;
+		if (ownership?.kind === "root" && !config.subagentRoot) throw new SubagentError("root_coordinator_required");
+		if (ownership?.kind === "child" && !config.subagentRunScope) throw new SubagentError("child_requires_root");
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this._subagentRunScope = config.subagentRunScope;
+		this._subagentPermission = config.subagentPermission;
+		this._collaborationTools = config.collaborationTools ?? [];
+		this.subagents = config.subagentRoot;
 		this._pendingDeliveryStore = new PendingDeliveryStore(this.sessionManager);
 		this.settingsManager = config.settingsManager;
 		this._executionUpgradeOverride = config.executionUpgrade ? structuredClone(config.executionUpgrade) : undefined;
@@ -631,6 +630,10 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		for (const item of this._pendingDeliveryStore.snapshot().items) {
+			if (this._subagentRunScope) {
+				this._pendingDeliveryStore.cancel(item.queueItemId);
+				continue;
+			}
 			if (item.channel === "steering") {
 				this.agent.steer({ queueItemId: item.queueItemId, message: item.message });
 			} else if (item.channel === "follow_up") {
@@ -653,7 +656,6 @@ export class AgentSession {
 			...reminderPolicy.todoNudge,
 			enabled: reminderPolicy.enabled && reminderPolicy.todoNudge.enabled,
 		});
-		this._subagentDepth = config.subagentDepth ?? 0;
 		const memoryRoot = config.memoryRootDir ?? getMemoryDir();
 		const memorySettings = this.settingsManager.getMemorySettings();
 		const memoryEmbeddingConfig = resolveEmbeddingConfig(memorySettings.embedding, process.env);
@@ -756,7 +758,9 @@ export class AgentSession {
 			: undefined;
 		this._memoryAuthority = this._memoryArchiveService?.authority ?? new MemoryAuthority(memoryRoot, this._cwd);
 		this._memoryArchiveEnabled =
-			memorySettings.enabled && memorySettings.archive.enabled && this._subagentDepth === 0;
+			memorySettings.enabled &&
+			memorySettings.archive.enabled &&
+			this.sessionManager.getHeader()?.ownership?.kind !== "child";
 		const allMemoryEvidence = this.sessionManager
 			.getEntries()
 			.filter((entry) => entry.type === "memory_evidence" && entry.visibility !== "project_rule");
@@ -863,6 +867,7 @@ export class AgentSession {
 			(taskId, chunk) => {
 				this._recordMemoryTaskOutput(taskId, chunk);
 			},
+			this._subagentRunScope,
 		);
 		// Grok-aligned TodoState persistence (spec 6.4): restore from the session's latest "todo-state"
 		// custom entry if one exists (resume/reload), otherwise start empty. The tool wiring below
@@ -902,73 +907,6 @@ export class AgentSession {
 		this._mcpManager = new McpManager(config.mcpServers);
 		this._webFetchOps = config.webFetchOperations ?? createDefaultWebFetchOperations();
 		this._webSearchOps = config.webSearchOperations;
-		this._sandboxProfileOverride = config.sandboxProfileOverride;
-		this._subagentCoordinator = new SubagentCoordinator(
-			this._taskManager,
-			(request: SubagentChildRequest, signal: AbortSignal) => {
-				if (!request.execution) throw new Error("Subagent execution profile was not captured at spawn.");
-				return runPiChildAgent({
-					deps: {
-						cwd: request.cwd,
-						model: request.execution.model,
-						thinkingLevel: request.execution.thinkingLevel,
-						executionUpgrade: request.execution.upgrade,
-						modelRuntime: this._modelRuntime,
-						resourceLoader: this._resourceLoader,
-						settingsManager: this.settingsManager,
-						webSearchOperations: this._webSearchOps,
-						activeToolNames: this._capabilityModeToolNames(request.capabilityMode),
-						systemPrompt: BUILTIN_SUBAGENT_PROMPTS[request.agentType],
-						subagentDepth: this._subagentDepth + 1,
-						// Grok-aligned (spec 12): read-only capability_mode gets the read-only sandbox
-						// profile; read-write/execute/all (anything that can mutate) gets workspace.
-						sandboxProfile: request.capabilityMode === "read-only" ? "read-only" : "workspace",
-					},
-					prompt: request.prompt,
-					signal,
-					onRequest: (header, sessionId, promptGeneration) => {
-						this._appendTraceSafely({
-							type: "task/request",
-							data: {
-								turn: this._taskTraceTurns.get(request.taskId) ?? Math.max(0, this._nextTraceTurn - 1),
-								taskId: request.taskId,
-								sessionId,
-								promptGeneration,
-								header,
-							},
-						});
-					},
-					onUpgrade: (outcome, sessionId, promptGeneration) => {
-						this._appendTraceSafely({
-							type: "execution/upgrade",
-							data: {
-								turn: this._taskTraceTurns.get(request.taskId) ?? Math.max(0, this._nextTraceTurn - 1),
-								step: -1,
-								sessionId,
-								promptGeneration,
-								taskId: request.taskId,
-								outcome,
-							},
-						});
-						this._emit({ type: "execution_upgrade", taskId: request.taskId, outcome });
-					},
-				});
-			},
-			{
-				depth: this._subagentDepth,
-				cwd: this._cwd,
-				ownerSessionId: this.sessionId,
-				getRootPromptId: () => this._memoryRootPromptId,
-				captureExecution: () => ({
-					model: structuredClone(this.agent.state.model),
-					thinkingLevel: this.thinkingLevel,
-					upgrade: structuredClone(
-						this._executionUpgradeOverride ?? this.settingsManager.getExecutionUpgradeSettings(),
-					),
-				}),
-			},
-		);
-
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
@@ -1000,6 +938,7 @@ export class AgentSession {
 			const readOnly = PLAN_MODE_READ_ONLY_TOOLS.filter((name) => this._toolRegistry.has(name));
 			this.setActiveToolsByName([...new Set([...readOnly, "enter_plan_mode", "exit_plan_mode"])]);
 		}
+		this.subagents?.bind(this, () => this._dispose());
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1181,7 +1120,7 @@ export class AgentSession {
 		if (
 			!this._recordMemoryEvidence(task.rootPromptId, {
 				sourceId: `${taskId}:output:${sequence}`,
-				origin: task.kind === "subagent" ? "subagent" : "tool",
+				origin: "tool",
 				content: chunk,
 				visibility: "session",
 				taskId,
@@ -1204,7 +1143,7 @@ export class AgentSession {
 			const snapshot = this._taskManager.get(transition.taskId);
 			const recorded = this._recordMemoryEvidence(rootPromptId, {
 				sourceId: `${transition.taskId}:terminal`,
-				origin: transition.kind === "subagent" ? "subagent" : "tool",
+				origin: "tool",
 				content: JSON.stringify(snapshot ?? transition),
 				visibility: "session",
 				taskId: transition.taskId,
@@ -1497,6 +1436,7 @@ export class AgentSession {
 		};
 
 		this.agent.guardToolCall = async ({ toolCall, args }) => {
+			this._subagentRunScope?.assertActive();
 			const { windowId } = this.sessionManager.ensureContextWindow();
 			const coordinates = this.sessionManager.getLatestContextCoordinates();
 			const saving = getSaveStateOperation(this.sessionManager, windowId, coordinates.promptGeneration);
@@ -2773,7 +2713,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -2909,31 +2849,6 @@ export class AgentSession {
 	 */
 	private _persistPlanModeState(): void {
 		this.sessionManager.appendCustomEntry("plan-mode-state", this._planModeState);
-	}
-
-	/** Maps a subagent capability_mode to concrete base tool names, filtered against this session's own registry so a subagent never gains a tool the parent itself does not have. */
-	private _capabilityModeToolNames(mode: "read-only" | "read-write" | "execute" | "all"): string[] {
-		const readOnly = [
-			"read",
-			"grep",
-			"find",
-			"ls",
-			"todo_write",
-			"history",
-			"context_note",
-			"get_context_remaining",
-			"new_context",
-			"upgrade_execution",
-		];
-		const wanted =
-			mode === "read-only"
-				? readOnly
-				: mode === "read-write"
-					? [...readOnly, "edit", "write"]
-					: mode === "execute"
-						? [...readOnly, "bash"]
-						: [...readOnly, "edit", "write", "bash"];
-		return wanted.filter((name) => this._toolRegistry.has(name));
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -3494,6 +3409,11 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	async dispose(): Promise<void> {
+		if (this.subagents) return this.subagents.close();
+		return this._dispose();
+	}
+
+	private async _dispose(): Promise<void> {
 		this._disposed = true;
 		if (this._memoryArchiveRetryTimer) clearTimeout(this._memoryArchiveRetryTimer);
 		this._memoryArchiveRetryTimer = undefined;
@@ -3503,16 +3423,29 @@ export class AgentSession {
 			() => this.abortCompaction(),
 			() => this.abortBranchSummary(),
 			() => this.abortBash(),
-			() => this.agent.abort(),
+			async () => {
+				this.agent.abort();
+				if (this._subagentRunScope) await this.agent.waitForIdle();
+			},
 			() => this._lspManager.disposeAll(),
 			() => this._mcpManager.disposeAll(),
-			() => this._taskManager.cancelAll("session disposed"),
+			async () => {
+				this._taskManager.cancelAll("session disposed");
+				await Promise.all(
+					this._taskManager
+						.list()
+						.filter((task) => task.status === "running" || task.status === "cancelling")
+						.map((task) => this._taskManager.awaitSettled(task.taskId)),
+				);
+			},
 		];
+		const failures: unknown[] = [];
 		for (const cleanup of cleanups) {
 			try {
 				await cleanup();
-			} catch {
+			} catch (error) {
 				// Every resource is attempted even when an earlier cleanup fails.
+				failures.push(error);
 			}
 		}
 
@@ -3522,6 +3455,8 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
+		if (this._subagentRunScope && failures.length)
+			throw new AggregateError(failures, "subagent_session_cleanup_failed");
 	}
 
 	// =========================================================================
@@ -3556,10 +3491,12 @@ export class AgentSession {
 	/** One gate for commit, resume, deferred scheduling and headless lifecycle. */
 	getContextTransitionGate(retainedRequiredIds: readonly string[] = []): ContextTransitionGate {
 		if (
-			this._pendingInteractions.list().length > 0 ||
+			this._pendingInteractions.list().length ||
 			this._taskManager
 				.list()
-				.some((task) => task.kind !== "subagent" && (task.status === "running" || task.status === "cancelling"))
+				.some(
+					(task) => task.archiveRole !== "service" && (task.status === "running" || task.status === "cancelling"),
+				)
 		)
 			return { status: "busy" };
 		const branch = this.sessionManager.getBranch();
@@ -3576,7 +3513,7 @@ export class AgentSession {
 			const scope = resolveTaskNoteScope(branch, this.sessionManager.getLatestContextCoordinates().promptGeneration);
 			return {
 				status: "ready",
-				...captureSubagentHandoff(this.sessionManager, scope, this._taskManager.list(), retainedRequiredIds),
+				...captureSubagentHandoff(this.sessionManager, scope, retainedRequiredIds),
 			};
 		} catch {
 			return { status: "invalid", reason: "subagent_handoff_invalid" };
@@ -3629,6 +3566,16 @@ export class AgentSession {
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
 			const tool = this._toolRegistry.get(name);
+			const definition = this._toolDefinitions.get(name)?.definition;
+			if (
+				definition &&
+				this._subagentPermission &&
+				!canUseSubagentTool(
+					this._subagentPermission(),
+					subagentToolPermission(definition, name, this._baseToolDefinitions.get(name) === definition),
+				)
+			)
+				continue;
 			if (tool) {
 				tools.push(tool);
 				validToolNames.push(name);
@@ -3756,6 +3703,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		this._subagentRunScope?.assertActive();
 		this._isAgentRunActive = true;
 		this._promptAborted = false;
 		try {
@@ -3763,6 +3711,7 @@ export class AgentSession {
 			while (true) {
 				const action = await this._handlePostAgentRun();
 				if (action !== "continue" && action !== "continue_save_state") break;
+				this._subagentRunScope?.assertActive();
 				await this.agent.continue(
 					action === "continue_save_state"
 						? {
@@ -3949,6 +3898,13 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (options?.source === "extension") this._subagentRunScope?.assertActive();
+		if (this.subagents) return this.subagents.run(() => this._prompt(text, options));
+		if (this._subagentRunScope) return this._subagentRunScope.track(() => this._prompt(text, options));
+		return this._prompt(text, options);
+	}
+
+	private async _prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._todoGateFireCount = 0;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -4226,7 +4182,8 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		if (this.subagents) await this.subagents.scope.join(() => this._queueSteer(expandedText, images));
+		else await this._queueSteer(expandedText, images);
 	}
 
 	/**
@@ -4246,7 +4203,8 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		if (this.subagents) await this.subagents.scope.join(() => this._queueFollowUp(expandedText, images));
+		else await this._queueFollowUp(expandedText, images);
 	}
 
 	/**
@@ -4257,6 +4215,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		origin: "user" | "runtime" | "extension" = "user",
 	): Promise<void> {
+		this._subagentRunScope?.assertActive();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -4279,6 +4238,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		origin: "user" | "runtime" | "extension" = "user",
 	): Promise<void> {
+		this._subagentRunScope?.assertActive();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -4324,6 +4284,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		if (options?.triggerTurn) this._subagentRunScope?.assertActive();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -4346,7 +4307,8 @@ export class AgentSession {
 			this._emitQueueUpdate();
 		} else if (options?.triggerTurn) {
 			this._beginContextPrompt();
-			await this._runAgentPrompt(appMessage);
+			if (this._subagentRunScope) await this._subagentRunScope.track(() => this._runAgentPrompt(appMessage));
+			else await this._runAgentPrompt(appMessage);
 		} else {
 			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntry(
@@ -4455,6 +4417,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this.subagents?.scope.abort();
 		this._promptAborted = true;
 		this._cancelExecutionUpgrade("User cancelled execution.");
 		this.abortCompaction();
@@ -5079,6 +5042,13 @@ export class AgentSession {
 	}
 
 	private async _resumePreparedContextRollover(): Promise<void> {
+		if (this._subagentRunScope && !this._subagentRunScope.isCurrent) return;
+		if (this._subagentRunScope) return this._subagentRunScope.track(() => this._resumePreparedContextRolloverOwned());
+		return this._resumePreparedContextRolloverOwned();
+	}
+
+	private async _resumePreparedContextRolloverOwned(): Promise<void> {
+		this._subagentRunScope?.assertActive();
 		if (this._isAgentRunActive) return;
 		const state = this.contextRolloverState;
 		const resumableDispatch = this._resumableInterruptedDispatch();
@@ -5362,6 +5332,7 @@ export class AgentSession {
 		runner.bindCore(
 			{
 				sendMessage: (message, options) => {
+					if (options?.triggerTurn || this.isStreaming) this._subagentRunScope?.assertActive();
 					this.sendCustomMessage(message, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
@@ -5371,6 +5342,7 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
+					this._subagentRunScope?.assertActive();
 					this.sendUserMessage(content, options).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
@@ -5522,6 +5494,26 @@ export class AgentSession {
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
 		}
+		if (this._subagentPermission) {
+			for (const [name, tool] of toolRegistry) {
+				const definition = definitionRegistry.get(name)!.definition;
+				const required = subagentToolPermission(
+					definition,
+					name,
+					this._baseToolDefinitions.get(name) === definition,
+				);
+				toolRegistry.set(name, {
+					...tool,
+					execute: (...args) => {
+						this._subagentRunScope?.assertActive();
+						if (!canUseSubagentTool(this._subagentPermission!(), required))
+							throw new SubagentError("tool_permission_denied");
+						if (required === "full") this._subagentRunScope?.markExternalEffect();
+						return tool.execute(...args);
+					},
+				});
+			}
+		}
 		this._toolRegistry = toolRegistry;
 
 		const nextActiveToolNames = (
@@ -5571,23 +5563,12 @@ export class AgentSession {
 						shellPath,
 						taskManager: this._taskManager,
 						...this.settingsManager.getBashBackgroundSettings(),
-						// Grok-aligned (spec 12): only subagents get an actual sandbox binding — read-only
-						// capability_mode -> "read-only" profile, everything else -> "workspace". A root/user
-						// session has no sandboxProfileOverride, but still honors an *explicitly configured*
-						// settings.sandbox block (spec 12) for its own bash tool; with no such config it stays
-						// unsandboxed (unchanged default) rather than silently adopting the resolved-default
-						// profile for every session, which would be a far larger behavior change than spec 12 asks for.
-						sandbox: this._sandboxProfileOverride
+						sandbox: this.settingsManager.hasExplicitSandboxSettings()
 							? {
 									manager: new SandboxManager({ workspaceRoot: this._cwd }),
-									settings: resolveSandboxSettings({ profile: this._sandboxProfileOverride }),
+									settings: this.settingsManager.getSandboxSettings(),
 								}
-							: this.settingsManager.hasExplicitSandboxSettings()
-								? {
-										manager: new SandboxManager({ workspaceRoot: this._cwd }),
-										settings: this.settingsManager.getSandboxSettings(),
-									}
-								: undefined,
+							: undefined,
 					},
 					taskManager: this._taskManager,
 					todoWrite: {
@@ -5653,17 +5634,7 @@ export class AgentSession {
 				use_tool: createMcpUseToolDefinition(this._mcpManager),
 			});
 		}
-		// Grok-aligned depth gate (see subagents/subagent-coordinator.ts): a subagent at
-		// MAX_SUBAGENT_DEPTH must have task/get_task_output/kill_task physically removed from its
-		// registry, not merely deactivated, so it cannot spawn further subagents.
-		if (this._subagentDepth >= MAX_SUBAGENT_DEPTH) {
-			delete (baseToolDefinitions as Record<string, unknown>).get_task_output;
-			delete (baseToolDefinitions as Record<string, unknown>).kill_task;
-		} else if (baseToolDefinitions.get_task_output && baseToolDefinitions.kill_task) {
-			// task only ever registers alongside get_task_output/kill_task (Grok dependency rule).
-			Object.assign(baseToolDefinitions, { task: createTaskToolDefinition(this._subagentCoordinator) });
-		}
-
+		Object.assign(baseToolDefinitions, Object.fromEntries(this._collaborationTools.map((tool) => [tool.name, tool])));
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
@@ -5696,7 +5667,7 @@ export class AgentSession {
 					"edit",
 					"write",
 					"todo_write",
-					"task",
+
 					"get_task_output",
 					"kill_task",
 					"history",
@@ -5707,6 +5678,7 @@ export class AgentSession {
 		if (!this._baseToolsOverride && this.settingsManager.getMemorySettings().enabled) {
 			defaultActiveToolNames.push("memory_search", "memory_get");
 		}
+		defaultActiveToolNames.push(...this._collaborationTools.map((tool) => tool.name));
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		if (options.activeToolNames === undefined && "upgrade_execution" in baseToolDefinitions)
 			baseActiveToolNames.push("upgrade_execution");
@@ -6360,6 +6332,7 @@ export class AgentSession {
 	 * @returns The resolved output file path.
 	 */
 	exportToJsonl(outputPath?: string): string {
+		this.sessionManager.assertIndependentSession();
 		const filePath = resolvePath(
 			outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
 			process.cwd(),
@@ -6373,6 +6346,7 @@ export class AgentSession {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: this.sessionManager.getSessionId(),
+			ownership: this.sessionManager.getHeader()?.ownership,
 			timestamp: new Date().toISOString(),
 			cwd: this.sessionManager.getCwd(),
 		};

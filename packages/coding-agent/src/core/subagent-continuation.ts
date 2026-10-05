@@ -1,12 +1,13 @@
 import { History } from "./history.ts";
 import type { SessionManager } from "./session-manager.ts";
+import { readControlLog } from "./subagents/control-log.ts";
+import { isSubagentTerminal, type SubagentRun } from "./subagents/types.ts";
 import {
 	buildTaskNoteProjectionFromBranch,
 	resolveTaskNoteScope,
 	type TaskNoteProjectionItem,
 	type TaskNoteScope,
 } from "./task-note-projection.ts";
-import type { TaskSnapshot } from "./tasks/types.ts";
 
 export interface SubagentContinuationRef {
 	taskId: string;
@@ -26,49 +27,50 @@ export type ContextTransitionGate =
 	| { status: "invalid"; reason: "subagent_handoff_invalid" };
 
 interface Delegation {
+	run: SubagentRun;
 	ref: SubagentContinuationRef;
 	taskScopeId: string;
 	arguments: Record<string, unknown>;
 }
 
-/** Resolve only canonical, branch-visible task results and their original calls. */
+/** Bind branch-visible calls to durable run identities, including calls interrupted before result delivery. */
 function delegations(manager: SessionManager): Delegation[] {
+	const owner = manager.getRootOwnership();
+	if (!owner) return [];
+	owner.assertActive();
+	const identity = manager.getHeader()?.ownership;
+	const issuerAgentId = identity?.kind === "child" ? identity.agentId : manager.getSessionId();
+	const runs = new Map<string, SubagentRun>();
+	for (const record of readControlLog(owner.rootFile, owner.rootSessionId)) {
+		const event = record.control;
+		if (
+			(event.kind === "agent_created" ||
+				event.kind === "run_accepted" ||
+				event.kind === "run_updated" ||
+				event.kind === "run_finished") &&
+			event.run.issuerAgentId === issuerAgentId &&
+			event.run.agentId !== issuerAgentId
+		)
+			runs.set(event.run.runId, event.run);
+	}
 	const branch = manager.getBranch();
 	const history = new History(manager).getItems();
 	const result: Delegation[] = [];
-	for (const item of history) {
-		if (item.role !== "toolResult" || item.toolName !== "task" || item.isError) continue;
-		const source = branch.find((entry) => entry.id === item.entryId);
-		const details =
-			source?.type === "tool_result_source"
-				? source.details
-				: source?.type === "message" && source.message.role === "toolResult"
-					? source.message.details
-					: undefined;
-		if (
-			!details ||
-			typeof details !== "object" ||
-			!("taskId" in details) ||
-			typeof details.taskId !== "string" ||
-			!details.taskId.trim()
-		)
-			throw new Error("subagent_handoff_invalid");
-		const call = history
+	for (const run of runs.values()) {
+		const calls = history
 			.flatMap((entry) => entry.blocks.map((block) => ({ entry, block })))
 			.filter(
 				({ block }) =>
-					block.type === "tool_call" && block.toolName === "task" && block.toolCallId === item.toolCallId,
+					block.type === "tool_call" &&
+					(block.toolName === "spawn_agent" || block.toolName === "followup_task") &&
+					block.toolCallId === run.toolCallId,
 			);
-		if (
-			call.length !== 1 ||
-			!item.toolCallId ||
-			!call[0].block.text ||
-			result.some((entry) => entry.ref.taskId === details.taskId)
-		)
-			throw new Error("subagent_handoff_invalid");
-		const callIndex = branch.findIndex((entry) => entry.id === call[0].entry.entryId);
-		if (callIndex < 0 || callIndex >= branch.findIndex((entry) => entry.id === item.entryId))
-			throw new Error("subagent_handoff_invalid");
+		// Delegation from another conversation branch is not part of this handoff.
+		if (!calls.length) continue;
+		if (calls.length !== 1 || !calls[0].block.text) throw new Error("subagent_handoff_invalid");
+		const call = calls[0];
+		const callIndex = branch.findIndex((entry) => entry.id === call.entry.entryId);
+		if (callIndex < 0) throw new Error("subagent_handoff_invalid");
 		const prefix = branch.slice(0, callIndex + 1);
 		let generation = 0;
 		for (const entry of prefix) {
@@ -83,22 +85,19 @@ function delegations(manager: SessionManager): Delegation[] {
 				generation = entry.data.promptGeneration;
 		}
 		const scope = resolveTaskNoteScope(prefix, generation);
-		const args: unknown = JSON.parse(call[0].block.text);
+		const args: unknown = JSON.parse(call.block.text!);
 		if (
 			!scope ||
 			!args ||
 			typeof args !== "object" ||
 			Array.isArray(args) ||
-			!("prompt" in args) ||
-			typeof args.prompt !== "string" ||
-			!("description" in args) ||
-			typeof args.description !== "string" ||
-			!("subagent_type" in args) ||
-			typeof args.subagent_type !== "string"
+			!("task" in args) ||
+			typeof args.task !== "string"
 		)
 			throw new Error("subagent_handoff_invalid");
 		result.push({
-			ref: { taskId: details.taskId, toolCallId: item.toolCallId, sourceEntryId: item.entryId },
+			run,
+			ref: { taskId: run.runId, toolCallId: run.toolCallId, sourceEntryId: call.entry.entryId },
 			taskScopeId: scope.taskScopeId,
 			arguments: args as Record<string, unknown>,
 		});
@@ -109,28 +108,10 @@ function delegations(manager: SessionManager): Delegation[] {
 export function captureSubagentHandoff(
 	manager: SessionManager,
 	scope: TaskNoteScope | undefined,
-	tasks: readonly TaskSnapshot[],
 	retainedRequiredIds: readonly string[] = [],
 ): SubagentHandoff {
 	const sources = delegations(manager);
-	const active = tasks.filter(
-		(task) => task.kind === "subagent" && (task.status === "running" || task.status === "cancelling"),
-	);
-	for (const task of tasks) {
-		if (
-			sources.some((source) => source.ref.taskId === task.taskId) &&
-			(task.kind !== "subagent" || task.ownerSessionId !== manager.getSessionId())
-		)
-			throw new Error("subagent_handoff_invalid");
-	}
-	if (
-		active.some(
-			(task) =>
-				task.ownerSessionId !== manager.getSessionId() ||
-				!sources.some((source) => source.ref.taskId === task.taskId),
-		)
-	)
-		throw new Error("subagent_handoff_invalid");
+	const active = sources.filter((source) => !isSubagentTerminal(source.run.state));
 	const projection = scope ? buildTaskNoteProjectionFromBranch(manager.getBranch(), scope) : undefined;
 	const note =
 		projection?.status === "valid"
@@ -155,7 +136,7 @@ export function captureSubagentHandoff(
 						referencedSources.has(source.ref.sourceEntryId),
 				)
 				.map((source) => source.ref.taskId),
-			...active.map((task) => task.taskId),
+			...active.map((source) => source.ref.taskId),
 			...selected.map((item) => item.taskId),
 		]),
 	];
@@ -209,9 +190,11 @@ export function subagentRecoveryRecords(
 			taskId: ref.taskId,
 			text: JSON.stringify({
 				...ref,
-				description: source.arguments.description,
+				runId: source.ref.taskId,
+				agentId: source.run.agentId,
+				description: source.arguments.task,
 				required,
-				query: { tool: "get_task_output", task_ids: [ref.taskId], timeout_ms: 0 },
+				query: { tool: "get_agent_info", runId: ref.taskId },
 				...(required
 					? {
 							historicalChildInstructions: source.arguments,

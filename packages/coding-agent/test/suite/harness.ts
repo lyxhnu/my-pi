@@ -76,8 +76,6 @@ export interface HarnessOptions {
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
-	/** Simulates constructing this session as a subagent at the given depth (see subagents/subagent-coordinator.ts). */
-	subagentDepth?: number;
 	/** Override the Grok-aligned memory root (default: a tmpdir under this harness's tempDir, never the real ~/.pi). */
 	memoryRootDir?: string;
 	memoryArchiveExtractor?: ConstructorParameters<typeof AgentSession>[0]["memoryArchiveExtractor"];
@@ -214,7 +212,6 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		allowedToolNames: options.allowedToolNames,
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
-		subagentDepth: options.subagentDepth,
 		memoryRootDir: options.memoryRootDir ?? join(tempDir, "memory"),
 		memoryArchiveExtractor: options.memoryArchiveExtractor,
 		lspServers: options.lspServers,

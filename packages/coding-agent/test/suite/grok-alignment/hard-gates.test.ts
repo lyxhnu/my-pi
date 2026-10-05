@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { checkMemoryCandidate } from "../../../src/core/memory/secret-filter.ts";
 import { SandboxManager } from "../../../src/core/sandbox/sandbox-manager.ts";
 import { resolveSandboxSettings } from "../../../src/core/sandbox/types.ts";
-import { MAX_SUBAGENT_DEPTH } from "../../../src/core/subagents/subagent-coordinator.ts";
 import { TaskManager } from "../../../src/core/tasks/task-manager.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -125,8 +124,8 @@ describe("Grok-alignment hard gates (M9 eval)", () => {
 		expect(["cancelled", "completed", "failed"]).toContain(settled.status);
 	});
 
-	it("gate: subagent depth > 1 == 0 (physically removed at MAX_SUBAGENT_DEPTH)", async () => {
-		const harness = await createHarness({ subagentDepth: MAX_SUBAGENT_DEPTH });
+	it("gate: an unmanaged session cannot use the removed worker delegation entry", async () => {
+		const harness = await createHarness();
 		harnesses.push(harness);
 		expect(harness.session.getAllTools().map((t) => t.name)).not.toContain("task");
 	});

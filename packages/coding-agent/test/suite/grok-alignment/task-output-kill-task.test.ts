@@ -1,11 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "../../../src/core/extensions/types.ts";
-import { TaskManager } from "../../../src/core/tasks/task-manager.ts";
+import type { TaskManager } from "../../../src/core/tasks/task-manager.ts";
 import { TaskOutputBuffer } from "../../../src/core/tasks/task-output-buffer.ts";
 import { createGetTaskOutputToolDefinition, resolveTaskIds } from "../../../src/core/tools/get-task-output.ts";
 import { createKillTaskToolDefinition } from "../../../src/core/tools/kill-task.ts";
+import { createHarness, type Harness } from "../harness.ts";
 
 const ctx = {} as ExtensionContext;
+let harness: Harness;
+beforeEach(async () => {
+	harness = await createHarness();
+});
+afterEach(async () => {
+	await harness.cleanup();
+});
 
 function startLongRunningTask(taskManager: TaskManager, ms = 5000) {
 	return taskManager.start({
@@ -37,11 +45,11 @@ describe("TaskManager.wait", () => {
 	it("clears a long timeout when the task settles first", async () => {
 		vi.useFakeTimers();
 		try {
-			const taskManager = new TaskManager();
+			const taskManager = harness.session.taskManager;
 			let finishTask!: (result: { status: "completed"; exitCode: number }) => void;
 			const { taskId } = taskManager.start({
-				kind: "subagent",
-				description: "quick foreground subagent",
+				kind: "diagnostics",
+				description: "quick diagnostics",
 				run: () =>
 					new Promise((resolve) => {
 						finishTask = resolve;
@@ -62,7 +70,7 @@ describe("TaskManager.wait", () => {
 	});
 
 	it("reports wait deadlines without changing task state", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const { taskId } = startLongRunningTask(taskManager);
 		const result = await taskManager.wait([taskId], { timeoutMs: 5 });
 		expect(result.timedOut).toBe(true);
@@ -72,7 +80,7 @@ describe("TaskManager.wait", () => {
 	});
 
 	it("settles synchronous run failures instead of leaving orphaned running tasks", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const { taskId } = taskManager.start({
 			kind: "diagnostics",
 			description: "throws synchronously",
@@ -105,16 +113,16 @@ describe("TaskOutputBuffer byte cursors", () => {
 
 describe("get_task_output tool", () => {
 	it("returns a non-blocking snapshot when timeout_ms is omitted", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const { taskId } = startLongRunningTask(taskManager);
 		const definition = createGetTaskOutputToolDefinition(taskManager);
 		const result = await definition.execute("call-1", { task_ids: [taskId] }, undefined, undefined, ctx);
 		const text = (result.content[0] as { text: string }).text;
-		expect(text).toContain("status=running");
+		expect(JSON.parse(text).reports[0].status).toBe("running");
 	});
 
 	it("waits for completion when timeout_ms > 0 (wait-all semantics)", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const snapshot = taskManager.start({
 			kind: "bash",
 			description: "quick",
@@ -132,12 +140,12 @@ describe("get_task_output tool", () => {
 			ctx,
 		);
 		const text = (result.content[0] as { text: string }).text;
-		expect(text).toContain("status=completed");
+		expect(JSON.parse(text).reports[0].status).toBe("completed");
 		expect(text).toContain("done output");
 	});
 
 	it("timing out never cancels the underlying task", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const { taskId } = startLongRunningTask(taskManager);
 		const definition = createGetTaskOutputToolDefinition(taskManager);
 		await definition.execute("call-1", { task_ids: [taskId], timeout_ms: 20 }, undefined, undefined, ctx);
@@ -146,7 +154,7 @@ describe("get_task_output tool", () => {
 	});
 
 	it("continues from the returned byte cursor", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const snapshot = taskManager.start({
 			kind: "bash",
 			description: "unicode output",
@@ -168,9 +176,9 @@ describe("get_task_output tool", () => {
 	});
 
 	it("returns blocked task results as structured JSON", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const snapshot = taskManager.start({
-			kind: "subagent",
+			kind: "diagnostics",
 			description: "blocked",
 			run: async () => ({
 				status: "blocked",
@@ -181,36 +189,37 @@ describe("get_task_output tool", () => {
 		const definition = createGetTaskOutputToolDefinition(taskManager);
 		const result = await definition.execute(
 			"call-1",
-			{ task_ids: [snapshot.taskId], timeout_ms: 500 },
+			{ view: "result", task_ids: [snapshot.taskId], timeout_ms: 500 },
 			undefined,
 			undefined,
 			ctx,
 		);
-		expect((result.content[0] as { text: string }).text).toContain('"blocker":"missing input"');
+		const page = JSON.parse((result.content[0] as { text: string }).text);
+		expect(JSON.parse(page.content).submission.blocker).toBe("missing input");
 		expect(result.details.snapshots?.[0]).toMatchObject({ status: "blocked" });
 	});
 });
 
 describe("kill_task tool", () => {
 	it("cancels a running task", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const { taskId } = startLongRunningTask(taskManager);
 		const definition = createKillTaskToolDefinition(taskManager);
 		const result = await definition.execute("call-1", { task_id: taskId }, undefined, undefined, ctx);
-		expect((result.content[0] as { text: string }).text).toContain("Killed task");
+		expect((result.content[0] as { text: string }).text).toContain("Cancellation requested");
 		const waitResult = await taskManager.wait([taskId], { timeoutMs: 500 });
 		expect(waitResult.snapshots[0]?.status).toBe("cancelled");
 	});
 
 	it("reports not found for an unknown id", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const definition = createKillTaskToolDefinition(taskManager);
 		const result = await definition.execute("call-1", { task_id: "does-not-exist" }, undefined, undefined, ctx);
 		expect((result.content[0] as { text: string }).text).toContain("not found");
 	});
 
 	it("reports already-completed for a finished task", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const snapshot = taskManager.start({
 			kind: "bash",
 			description: "quick",
@@ -223,10 +232,10 @@ describe("kill_task tool", () => {
 	});
 
 	it("cascades cancellation to child tasks (parentTaskId)", async () => {
-		const taskManager = new TaskManager();
+		const taskManager = harness.session.taskManager;
 		const parent = startLongRunningTask(taskManager);
 		const child = taskManager.start({
-			kind: "subagent",
+			kind: "diagnostics",
 			parentTaskId: parent.taskId,
 			description: "child",
 			run: (taskCtx) =>

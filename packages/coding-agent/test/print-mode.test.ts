@@ -111,6 +111,17 @@ afterEach(() => {
 });
 
 describe("runPrintMode", () => {
+	it("waits for accepted session continuations before disposing", async () => {
+		const host = createRuntimeHost(createAssistantMessage({ text: "waiting" }));
+		host.session.state.runState = { status: "idle", lastOutcome: { type: "completed" } };
+		host.session.waitForIdle.mockImplementation(async () => {
+			expect(host.dispose).not.toHaveBeenCalled();
+			host.session.state.messages = [createAssistantMessage({ text: "continuation received" })];
+		});
+		expect(await runPrintMode(host as unknown as Parameters<typeof runPrintMode>[0], { mode: "text" })).toBe(0);
+		expect(host.session.waitForIdle).toHaveBeenCalledOnce();
+		expect(host.dispose).toHaveBeenCalledOnce();
+	});
 	it.each(["text", "json"] as const)(
 		"reports a blocked maintenance request without an assistant in %s mode",
 		async (mode) => {
@@ -139,7 +150,7 @@ describe("runPrintMode", () => {
 
 		expect(await runPrintMode(host as unknown as Parameters<typeof runPrintMode>[0], { mode: "text" })).toBe(0);
 		expect(host.session.taskManager.awaitSettled).toHaveBeenCalledWith("task-1");
-		expect(host.session.waitForIdle).toHaveBeenCalledTimes(1);
+		expect(host.session.waitForIdle).toHaveBeenCalledTimes(2);
 		expect(errors).not.toHaveBeenCalled();
 	});
 

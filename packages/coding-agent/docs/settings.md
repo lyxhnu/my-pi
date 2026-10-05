@@ -60,6 +60,14 @@ Use `/trust` in interactive mode to save a project trust decision for future ses
 
 Thresholds only produce a reminder; they never select a model. The executing agent must explicitly call `upgrade_execution`. With an empty model order, only higher supported thinking levels on the current model are available. See [Execution upgrades](execution-upgrades.md) for configuration, lifecycle, and trace inspection.
 
+### Subagents
+
+Persistent CLI/SDK sessions enable in-process subagents by default. Every root can create 8 child identities over its lifetime and run 3 children concurrently, counting every generation. Followups reuse an existing child's context and identity.
+
+`spawn_agent` chooses a `read-only`, `read-write`, or `full` tool capability ceiling. `wait_agent.timeoutMs` only ends the wait; the parent decides whether to keep waiting or interrupt. The former `subagents.maxExecutionMs`, `minReviewIntervalMs`, and `cancellationGraceMs` settings have been removed.
+
+See [Subagents](subagents.md) for tools, queue/message limits, ownership, cooperative cancellation, and SDK configuration.
+
 ### UI & Display
 
 | Setting | Type | Default | Description |

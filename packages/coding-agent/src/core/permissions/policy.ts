@@ -23,11 +23,18 @@ const SESSION_TOOLS = new Set([
 	"enter_plan_mode",
 	"exit_plan_mode",
 	"upgrade_execution",
+	"spawn_agent",
+	"followup_task",
+	"send_message",
+	"list_agents",
+	"get_agent_info",
+	"wait_agent",
+	"interrupt_agent",
 ]);
 
 /** Tools that write files. Gated by mode (see `decideToolPermission`). */
 const WRITE_TOOLS = new Set(["edit", "write"]);
-const PROCESS_TOOLS = new Set(["bash", "task", "kill_task", "lsp"]);
+const PROCESS_TOOLS = new Set(["bash", "kill_task", "lsp"]);
 const NETWORK_TOOLS = new Set(["web_fetch", "web_search"]);
 const EXTERNAL_TOOLS = new Set(["search_tool", "use_tool"]);
 

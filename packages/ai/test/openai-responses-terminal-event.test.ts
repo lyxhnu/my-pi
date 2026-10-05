@@ -154,6 +154,47 @@ async function* createFailedEvents(): AsyncIterable<ResponseStreamEvent> {
 }
 
 describe("OpenAI Responses terminal event handling", () => {
+	it.each([createCompletedEvents, createIncompleteEvents])(
+		"closes and awaits the transport after a terminal event without requesting EOF (%#)",
+		async (events) => {
+			const model = createModel();
+			const output = createOutput(model);
+			const terminal = (await events()[Symbol.asyncIterator]().next()).value as ResponseStreamEvent;
+			let release!: () => void;
+			const cleanup = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const close = vi.fn(async () => {
+				await cleanup;
+				return { done: true as const, value: undefined };
+			});
+			const next = vi
+				.fn<() => Promise<IteratorResult<ResponseStreamEvent>>>()
+				.mockResolvedValueOnce({ done: false, value: terminal })
+				.mockRejectedValue(new Error("must not wait for another event after completion"));
+			const source: AsyncIterable<ResponseStreamEvent> = {
+				[Symbol.asyncIterator]: () => ({ next, return: close }),
+			};
+			let settled = false;
+			const processing = processResponsesStream(source, output, new AssistantMessageEventStream(), model);
+			void processing.then(
+				() => {
+					settled = true;
+				},
+				() => {},
+			);
+			try {
+				await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+				expect(settled).toBe(false);
+				expect(next).toHaveBeenCalledOnce();
+			} finally {
+				release();
+			}
+			await processing;
+			expect(settled).toBe(true);
+		},
+	);
+
 	it("rejects streams that end before a terminal response event", async () => {
 		const model = createModel();
 		const output = createOutput(model);

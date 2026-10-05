@@ -10,20 +10,23 @@ import { randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
+	copyFileSync,
 	createReadStream,
 	existsSync,
 	fstatSync,
+	fsyncSync,
 	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -49,6 +52,9 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { controlChecksum, readControlLog } from "./subagents/control-log.ts";
+import { canonicalSessionFile, RootSessionOwnership, type SessionOwnership } from "./subagents/session-ownership.ts";
+import { type SubagentControlEvent, type SubagentControlRecord, SubagentError } from "./subagents/types.ts";
 import type { SessionTraceEvent } from "./trace.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -60,6 +66,7 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	ownership?: SessionOwnership;
 }
 
 export interface NewSessionOptions {
@@ -325,6 +332,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
+	| SubagentControlRecord
 	| SessionMessageEntry
 	| ToolResultSourceEntry
 	| PendingDeliveryEntry
@@ -545,8 +553,8 @@ function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntr
 	return index;
 }
 
-function isLogOnlyEntry(entry: SessionEntry): entry is SessionTraceEntry | MemoryEvidenceEntry {
-	return entry.type === "trace" || entry.type === "memory_evidence";
+function isLogOnlyEntry(entry: SessionEntry): entry is SessionTraceEntry | MemoryEvidenceEntry | SubagentControlRecord {
+	return entry.type === "trace" || entry.type === "memory_evidence" || entry.type === "subagent_control";
 }
 
 function buildSessionPath(
@@ -844,7 +852,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
 				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
+				if (entry && entry.type !== "subagent_control") entries.push(entry);
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
@@ -855,7 +863,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		const finalEntry = parseSessionEntryLine(pending);
 		if (pending.trim() && !finalEntry)
 			throw new Error("Session ends with an incomplete record; automatic recovery is unsafe");
-		if (finalEntry) entries.push(finalEntry);
+		if (finalEntry && finalEntry.type !== "subagent_control") entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
 	}
@@ -927,6 +935,17 @@ function readSessionHeader(filePath: string): SessionHeader | null {
 	}
 }
 
+export function readSessionHeaderForOpen(filePath: string, preloaded?: FileEntry[]): SessionHeader | null {
+	if (preloaded) return preloaded[0]?.type === "session" ? preloaded[0] : null;
+	try {
+		return readSessionHeader(filePath);
+	} catch (error) {
+		if (!(error instanceof SessionHeaderScanLimitError)) throw error;
+		const entries = loadEntriesFromFile(filePath);
+		return entries[0]?.type === "session" ? entries[0] : null;
+	}
+}
+
 function readSessionHeaderForDiscovery(filePath: string): SessionHeader | null {
 	try {
 		return readSessionHeader(filePath);
@@ -958,6 +977,7 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 			.filter(
 				(file): file is { path: string; header: SessionHeader } =>
 					file.header !== null &&
+					file.header.ownership?.kind !== "child" &&
 					(!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(file.header), resolvedCwd)),
 			)
 			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
@@ -1020,6 +1040,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 
 			if (!header) {
 				if (entry.type !== "session") return null;
+				if (entry.ownership?.kind === "child") return null;
 				header = entry;
 				continue;
 			}
@@ -1179,6 +1200,12 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private ownership?: RootSessionOwnership;
+	private ownershipIdentity?: SessionOwnership;
+	private ownershipRevoked = false;
+	private ownershipClaimed = false;
+	private controlHead?: { sequence: number; checksum: string };
+	private controlWriteFailed = false;
 
 	private constructor(
 		cwd: string,
@@ -1187,29 +1214,52 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		ownership?: RootSessionOwnership,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		this.ownership = ownership;
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
 
-		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
-		} else {
-			this.newSession(newSessionOptions);
+		try {
+			if (sessionFile) this._setSessionFile(sessionFile, preloadedFileEntries);
+			else this.newSession(newSessionOptions);
+		} catch (error) {
+			if (!ownership) this.ownership?.close();
+			else if (this.ownershipClaimed) ownership.releaseManager(this.sessionId, this);
+			throw error;
 		}
 	}
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
+		this.assertMutableIdentity();
 		this._setSessionFile(sessionFile);
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			const identity = readSessionHeaderForOpen(this.sessionFile, preloadedFileEntries)?.ownership;
+			if (identity) {
+				if (identity.kind === "child" && !this.ownership) {
+					throw new SubagentError(
+						"child_requires_root",
+						`Open root ${identity.rootSessionId} to restore this child`,
+					);
+				}
+				if (identity.kind === "root" && canonicalSessionFile(this.sessionFile) !== identity.rootFile) {
+					throw new SubagentError("root_file_mismatch");
+				}
+				this.ownership ??= RootSessionOwnership.acquire(identity.rootSessionId, identity.rootFile);
+				this.ownershipIdentity = structuredClone(identity);
+				this.sessionId = identity.kind === "root" ? identity.rootSessionId : identity.sessionId;
+				this.ownership.claim(identity, this.sessionId, this.sessionFile, this);
+				this.ownershipClaimed = true;
+			}
 			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
@@ -1227,6 +1277,7 @@ export class SessionManager {
 			}
 
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
+			if (identity && header?.id !== this.sessionId) throw new SubagentError("session_identity_changed");
 			this.sessionId = header?.id ?? createSessionId();
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
@@ -1243,6 +1294,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		this.assertMutableIdentity();
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -1295,14 +1347,199 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
-		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+		this.withWriteOwnership(() => {
+			const temporaryFile = `${this.sessionFile}.${randomUUID()}.tmp`;
+			try {
+				const fd = openSync(temporaryFile, "wx");
+				try {
+					for (const entry of this.fileEntries) {
+						writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+					}
+					if (this.ownershipIdentity?.kind === "root" && existsSync(this.sessionFile!)) {
+						for (const record of readControlLog(this.sessionFile!, this.sessionId)) {
+							writeFileSync(fd, `${JSON.stringify(record)}\n`);
+						}
+					}
+					fsyncSync(fd);
+				} finally {
+					closeSync(fd);
+				}
+				renameSync(temporaryFile, this.sessionFile!);
+			} finally {
+				if (existsSync(temporaryFile)) rmSync(temporaryFile);
 			}
-		} finally {
-			closeSync(fd);
+		});
+	}
+
+	private assertMutableIdentity(): void {
+		if (this.ownershipRevoked) throw new SubagentError("session_ownership_revoked");
+		if (this.ownershipIdentity) throw new SubagentError("managed_session_identity_fixed");
+	}
+
+	private withWriteOwnership<T>(write: () => T): T {
+		if (this.ownershipRevoked) throw new SubagentError("session_ownership_revoked");
+		if (!this.persist || !this.sessionFile) return write();
+		if (this.ownership) {
+			this.ownership.assertManager(this.sessionId, this.sessionFile, this);
+			return write();
 		}
+		// Plain SessionManager users also participate while writing, so a manager
+		// opened before a root was claimed cannot race the ownership transition.
+		const transient = RootSessionOwnership.acquire(this.sessionId, this.sessionFile, false);
+		try {
+			if (existsSync(this.sessionFile)) {
+				const current = readSessionHeaderForOpen(this.sessionFile);
+				if (current?.ownership) throw new SubagentError("session_ownership_required");
+				if (current && current.id !== this.sessionId) throw new SubagentError("session_identity_changed");
+			}
+			return write();
+		} finally {
+			transient.close();
+		}
+	}
+
+	/** Claim before constructing an agent runtime or executing any model work. */
+	claimRootOwnership(): RootSessionOwnership {
+		if (this.ownershipRevoked) throw new SubagentError("session_ownership_revoked");
+		if (this.ownershipIdentity?.kind === "child") throw new SubagentError("child_requires_root");
+		if (this.ownership) return this.ownership;
+		if (!this.sessionFile || !this.persist) throw new SubagentError("subagent_persistence_required");
+		const owner = RootSessionOwnership.acquire(this.sessionId, this.sessionFile);
+		try {
+			if (existsSync(this.sessionFile)) {
+				const currentEntries = loadEntriesFromFile(this.sessionFile);
+				if (
+					currentEntries.length !== this.fileEntries.length ||
+					currentEntries.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(this.fileEntries[index]))
+				)
+					throw new SubagentError("session_changed_since_open");
+			}
+		} catch (error) {
+			owner.close();
+			throw error;
+		}
+		const identity: SessionOwnership = { kind: "root", rootSessionId: this.sessionId, rootFile: owner.rootFile };
+		const header = this.getHeader();
+		if (!header) {
+			owner.close();
+			throw new SubagentError("session_header_missing");
+		}
+		owner.claim(identity, this.sessionId, this.sessionFile, this);
+		this.ownershipClaimed = true;
+		this.ownership = owner;
+		this.ownershipIdentity = identity;
+		header.ownership = identity;
+		try {
+			this._rewriteFile();
+			this.flushed = true;
+		} catch (error) {
+			owner.close();
+			this.ownershipRevoked = true;
+			throw error;
+		}
+		return owner;
+	}
+
+	getRootOwnership(): RootSessionOwnership | undefined {
+		return this.ownership;
+	}
+
+	assertIndependentSession(): void {
+		if (this.ownershipIdentity?.kind === "child") throw new SubagentError("child_requires_root");
+	}
+
+	/** Fork the committed branch without opening a second writable source manager. */
+	forkBranch(leafId: string): SessionManager {
+		this.assertIndependentSession();
+		if (this.ownershipRevoked) throw new SubagentError("session_ownership_revoked");
+		const fork = new SessionManager(this.cwd, this.sessionDir, undefined, this.persist);
+		fork.fileEntries = structuredClone(this.fileEntries);
+		fork.sessionId = this.sessionId;
+		fork.sessionFile = this.sessionFile;
+		fork._buildIndex();
+		fork.createBranchedSession(leafId);
+		return fork;
+	}
+
+	*readSubagentControl(): Generator<SubagentControlRecord> {
+		if (!this.sessionFile || this.ownershipIdentity?.kind !== "root")
+			throw new SubagentError("root_ownership_required");
+		this.ownership!.assertManager(this.sessionId, this.sessionFile, this);
+		yield* readControlLog(this.sessionFile, this.sessionId);
+	}
+
+	/** A durable, log-only commit. It never changes the conversation leaf. */
+	appendSubagentControl(event: SubagentControlEvent): SubagentControlRecord {
+		if (this.controlWriteFailed) throw new SubagentError("control_log_write_uncertain");
+		if (!this.sessionFile || this.ownershipIdentity?.kind !== "root")
+			throw new SubagentError("root_ownership_required");
+		if (!this.controlHead) {
+			let head = { sequence: 0, checksum: "" };
+			for (const record of this.readSubagentControl())
+				head = { sequence: record.sequence, checksum: record.checksum };
+			this.controlHead = head;
+		}
+		const body: Omit<SubagentControlRecord, "checksum"> = {
+			type: "subagent_control",
+			id: randomUUID(),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			rootSessionId: this.sessionId,
+			sequence: this.controlHead.sequence + 1,
+			previousChecksum: this.controlHead.checksum,
+			control: structuredClone(event),
+		};
+		const record: SubagentControlRecord = { ...body, checksum: controlChecksum(body) };
+		this.withWriteOwnership(() => {
+			const fd = openSync(this.sessionFile!, "a+");
+			const originalSize = fstatSync(fd).size;
+			try {
+				if (originalSize > 0) {
+					const lastByte = Buffer.alloc(1);
+					readSync(fd, lastByte, 0, 1, originalSize - 1);
+					if (lastByte[0] !== 10) writeFileSync(fd, "\n");
+				}
+				writeFileSync(fd, `${JSON.stringify(record)}\n`);
+				fsyncSync(fd);
+			} catch (error) {
+				try {
+					ftruncateSync(fd, originalSize);
+					fsyncSync(fd);
+				} catch {
+					this.controlWriteFailed = true;
+				}
+				throw error;
+			} finally {
+				closeSync(fd);
+			}
+		});
+		this.controlHead = { sequence: record.sequence, checksum: record.checksum };
+		return record;
+	}
+
+	/** The root coordinator calls this only after all runtime and tool cleanup. */
+	closeOwnership(): void {
+		if (!this.ownership || this.ownershipRevoked) return;
+		this.ownershipRevoked = true;
+		this.ownership.releaseManager(this.sessionId, this);
+		if (this.ownershipIdentity?.kind === "root") this.ownership.close();
+	}
+
+	flush(): void {
+		if (!this.persist || !this.sessionFile) return;
+		if (!this.flushed) {
+			this._rewriteFile();
+			this.flushed = true;
+			return;
+		}
+		this.withWriteOwnership(() => {
+			const fd = openSync(this.sessionFile!, "r+");
+			try {
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+		});
 	}
 
 	isPersisted(): boolean {
@@ -1330,6 +1567,10 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
+		this.withWriteOwnership(() => this.persistEntry(entry));
+	}
+
+	private persistEntry(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		const mustPersist = this.fileEntries.some(
@@ -2120,6 +2361,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this.assertMutableIdentity();
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -2244,13 +2486,48 @@ export class SessionManager {
 		return new SessionManager(cwd, dir, undefined, true, options);
 	}
 
+	/** Keep import's copy step inside the same ownership boundary as append/open. */
+	static copyIndependentSession(source: string, destination: string): void {
+		const sourceHeader = readSessionHeaderForOpen(source);
+		if (!sourceHeader) throw new SubagentError("session_header_missing");
+		if (sourceHeader.ownership)
+			throw new SubagentError(
+				sourceHeader.ownership.kind === "child" ? "child_requires_root" : "root_file_mismatch",
+			);
+		const owners: RootSessionOwnership[] = [];
+		try {
+			owners.push(RootSessionOwnership.acquire(sourceHeader.id, source, false));
+			const targetHeader = existsSync(destination) ? readSessionHeaderForOpen(destination) : null;
+			if (targetHeader?.ownership) throw new SubagentError("session_ownership_required");
+			if (targetHeader && targetHeader.id !== sourceHeader.id)
+				owners.push(RootSessionOwnership.acquire(targetHeader.id, destination, false));
+			const currentSource = readSessionHeaderForOpen(source);
+			const currentTarget = existsSync(destination) ? readSessionHeaderForOpen(destination) : null;
+			if (
+				currentSource?.ownership ||
+				currentSource?.id !== sourceHeader.id ||
+				currentTarget?.ownership ||
+				currentTarget?.id !== targetHeader?.id
+			)
+				throw new SubagentError("session_changed_since_open");
+			copyFileSync(source, destination);
+		} finally {
+			for (const owner of owners.reverse()) owner.close();
+		}
+	}
+
 	/**
 	 * Open a specific session file.
 	 * @param path Path to session file
 	 * @param sessionDir Optional session directory for /new or /branch. If omitted, derives from file's parent.
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
-	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+	static open(
+		path: string,
+		sessionDir?: string,
+		cwdOverride?: string,
+		ownership?: RootSessionOwnership,
+	): SessionManager {
 		const resolvedPath = resolvePath(path);
 		let header: SessionHeader | null = null;
 		let preloadedFileEntries: FileEntry[] | undefined;
@@ -2269,7 +2546,41 @@ export class SessionManager {
 		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries, ownership);
+	}
+
+	static createChild(
+		cwd: string,
+		file: string,
+		sessionId: string,
+		agentId: string,
+		ownership: RootSessionOwnership,
+	): SessionManager {
+		const directory = dirname(resolvePath(file));
+		mkdirSync(directory, { recursive: true });
+		if (existsSync(file)) throw new SubagentError("child_session_already_exists");
+		ownership.registerChild(agentId, sessionId, file, false);
+		const manager = new SessionManager(cwd, directory, undefined, true, { id: sessionId });
+		manager.sessionFile = resolvePath(file);
+		manager.ownership = ownership;
+		const identity: SessionOwnership = {
+			kind: "child",
+			rootSessionId: ownership.rootSessionId,
+			rootFile: ownership.rootFile,
+			agentId,
+			sessionId,
+		};
+		manager.ownershipIdentity = identity;
+		manager.getHeader()!.ownership = identity;
+		ownership.claim(identity, sessionId, file, manager);
+		manager.ownershipClaimed = true;
+		try {
+			manager.flush();
+		} catch (error) {
+			manager.closeOwnership();
+			throw error;
+		}
+		return manager;
 	}
 
 	/**
@@ -2307,6 +2618,9 @@ export class SessionManager {
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
+		if (readSessionHeaderForOpen(resolvedSourcePath)?.ownership?.kind === "child") {
+			throw new SubagentError("child_requires_root");
+		}
 		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);

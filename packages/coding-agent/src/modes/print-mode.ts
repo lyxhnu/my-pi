@@ -137,7 +137,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			}
 			const activeTaskIds = session.taskManager
 				.list()
-				.filter((task) => task.kind !== "subagent" && (task.status === "running" || task.status === "cancelling"))
+				.filter(
+					(task) => task.archiveRole !== "service" && (task.status === "running" || task.status === "cancelling"),
+				)
 				.map((task) => task.taskId);
 			if (activeTaskIds.length === 0) break;
 			await Promise.all(activeTaskIds.map((taskId) => session.taskManager.awaitSettled(taskId)));
@@ -147,6 +149,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await Promise.resolve();
 			await session.waitForIdle();
 		}
+
+		if (session.state.runState.status === "idle" && session.state.runState.lastOutcome?.type === "completed")
+			await session.waitForIdle();
 
 		if (session.contextRolloverState.dispatchState === "outcome_unknown") {
 			console.error(

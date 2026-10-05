@@ -545,6 +545,10 @@ export class SettingsManager {
 		return structuredClone(this.globalSettings);
 	}
 
+	getEffectiveSettings(): Settings {
+		return structuredClone(this.settings);
+	}
+
 	getProjectSettings(): Settings {
 		return structuredClone(this.projectSettings);
 	}
@@ -976,8 +980,8 @@ export class SettingsManager {
 	 * defaults from getSandboxSettings()). Used to decide whether the *root* session's own bash tool
 	 * should be wrapped: applying the resolved-default profile to every session unconditionally would be
 	 * a much larger behavior change than spec 12 calls for, so the root session only gets sandboxed when
-	 * the user opted in explicitly. Subagents are unaffected by this — see subagent-coordinator.ts, which
-	 * always assigns a profile by capability_mode regardless of this flag.
+	 * the user opted in explicitly. Children inherit this setting; their capability tiers do not create
+	 * an operating-system sandbox.
 	 */
 	hasExplicitSandboxSettings(): boolean {
 		return this.settings.sandbox !== undefined;

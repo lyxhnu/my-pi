@@ -526,6 +526,10 @@ describe("AgentSessionRuntime characterization", () => {
 		await otherRuntime.session.prompt("other");
 		const otherSessionFile = otherRuntime.session.sessionFile!;
 
+		const originalSession = runtime.session;
+		await expect(runtime.switchSession(otherSessionFile)).rejects.toMatchObject({ code: "root_in_use" });
+		expect(runtime.session).toBe(originalSession);
+		await otherRuntime.dispose();
 		await runtime.switchSession(otherSessionFile);
 
 		expect(realpathSync(runtime.session.sessionManager.getCwd())).toBe(realpathSync(secondDir));
@@ -601,6 +605,10 @@ describe("AgentSessionRuntime characterization", () => {
 		await otherRuntime.session.prompt("hello");
 		const targetSessionFile = otherRuntime.session.sessionFile!;
 
+		const originalSession = runtime.session;
+		await expect(runtime.switchSession(targetSessionFile)).rejects.toMatchObject({ code: "root_in_use" });
+		expect(runtime.session).toBe(originalSession);
+		await otherRuntime.dispose();
 		await runtime.switchSession(targetSessionFile);
 
 		expect(runtime.session.model?.id).toBe("faux-2");

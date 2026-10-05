@@ -51,6 +51,7 @@ export interface CreateAgentSessionServicesOptions {
  * have been resolved against those services.
  */
 export interface CreateAgentSessionFromServicesOptions {
+	subagents?: CreateAgentSessionOptions["subagents"];
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
@@ -202,6 +203,7 @@ export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
 	return createAgentSession({
+		subagents: options.subagents,
 		cwd: options.services.cwd,
 		agentDir: options.services.agentDir,
 		modelRuntime: options.services.modelRuntime,

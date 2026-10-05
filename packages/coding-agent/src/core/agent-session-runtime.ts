@@ -1,5 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { basename, join } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -12,7 +12,9 @@ import type {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
-import { SessionManager } from "./session-manager.ts";
+import { readSessionHeaderForOpen, SessionManager } from "./session-manager.ts";
+import { canonicalSessionFile } from "./subagents/session-ownership.ts";
+import { SubagentError } from "./subagents/types.ts";
 
 /**
  * Result returned by runtime creation.
@@ -165,6 +167,13 @@ export class AgentSessionRuntime {
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		if (this.session.subagents) {
+			await this.session.subagents.close({
+				event: { type: "session_shutdown", reason, targetSessionFile },
+				beforeDispose: this.beforeSessionInvalidate,
+			});
+			return;
+		}
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,
@@ -190,6 +199,11 @@ export class AgentSessionRuntime {
 		}
 	}
 
+	private isCurrentSessionFile(file: string): boolean {
+		const current = this.session.sessionFile;
+		return current !== undefined && canonicalSessionFile(file) === canonicalSessionFile(current);
+	}
+
 	async switchSession(
 		sessionPath: string,
 		options?: {
@@ -198,15 +212,31 @@ export class AgentSessionRuntime {
 			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
 		},
 	): Promise<{ cancelled: boolean }> {
+		this.session.sessionManager.assertIndependentSession();
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 
 		const previousSessionFile = this.session.sessionFile;
+		const sameFile = this.isCurrentSessionFile(sessionPath);
+		if (sameFile) {
+			const cwd = options?.cwdOverride ?? this.session.sessionManager.getCwd();
+			assertSessionCwdExists({ getCwd: () => cwd, getSessionFile: () => sessionPath }, this.cwd);
+			if (canonicalSessionFile(cwd) === canonicalSessionFile(this.cwd)) {
+				await this.finishSessionReplacement(options?.withSession);
+				return { cancelled: false };
+			}
+			await this.teardownCurrent("resume", sessionPath);
+		}
 		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		try {
+			assertSessionCwdExists(sessionManager, this.cwd);
+			if (!sameFile) await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		} catch (error) {
+			sessionManager.closeOwnership();
+			throw error;
+		}
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
@@ -225,6 +255,7 @@ export class AgentSessionRuntime {
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
+		this.session.sessionManager.assertIndependentSession();
 		const beforeResult = await this.emitBeforeSwitch("new");
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -260,6 +291,7 @@ export class AgentSessionRuntime {
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		this.session.sessionManager.assertIndependentSession();
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
 		if (beforeResult.cancelled) {
@@ -311,8 +343,8 @@ export class AgentSessionRuntime {
 					"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
 				);
 			}
-			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
-			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+			const sessionManager = this.session.sessionManager.forkBranch(targetLeafId);
+			const forkedSessionPath = sessionManager.getSessionFile();
 			if (!forkedSessionPath) {
 				throw new Error("Failed to create forked session");
 			}
@@ -356,10 +388,13 @@ export class AgentSessionRuntime {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		this.session.sessionManager.assertIndependentSession();
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
+		const identity = readSessionHeaderForOpen(resolvedPath)?.ownership;
+		if (identity?.kind === "child") throw new SubagentError("child_requires_root");
 
 		const sessionDir = this.session.sessionManager.getSessionDir();
 		if (!existsSync(sessionDir)) {
@@ -367,19 +402,40 @@ export class AgentSessionRuntime {
 		}
 
 		const destinationPath = join(sessionDir, basename(resolvedPath));
+		const copyRequired = canonicalSessionFile(destinationPath) !== canonicalSessionFile(resolvedPath);
+		if (copyRequired) {
+			if (identity) throw new SubagentError("root_file_mismatch");
+			if (existsSync(destinationPath) && readSessionHeaderForOpen(destinationPath)?.ownership)
+				throw new SubagentError("session_ownership_required");
+		}
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (resolve(destinationPath) !== resolvedPath) {
-			copyFileSync(resolvedPath, destinationPath);
+		if (copyRequired) {
+			SessionManager.copyIndependentSession(resolvedPath, destinationPath);
 		}
 
+		const sameFile = this.isCurrentSessionFile(destinationPath);
+		if (sameFile) {
+			const cwd = cwdOverride ?? this.session.sessionManager.getCwd();
+			assertSessionCwdExists({ getCwd: () => cwd, getSessionFile: () => destinationPath }, this.cwd);
+			if (canonicalSessionFile(cwd) === canonicalSessionFile(this.cwd)) {
+				await this.finishSessionReplacement();
+				return { cancelled: false };
+			}
+			await this.teardownCurrent("resume", destinationPath);
+		}
 		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		try {
+			assertSessionCwdExists(sessionManager, this.cwd);
+			if (!sameFile) await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		} catch (error) {
+			sessionManager.closeOwnership();
+			throw error;
+		}
 		this.apply(
 			await this.createRuntime({
 				cwd: sessionManager.getCwd(),
@@ -393,12 +449,7 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.beforeSessionInvalidate?.();
-		await this.session.dispose();
+		await this.teardownCurrent("quit");
 	}
 }
 

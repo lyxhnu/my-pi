@@ -1,14 +1,18 @@
 # 子 Agent 跨上下文窗口执行 Spec
 
+> 历史规范（2026-09）：其中的 worker、task、TaskManager 子任务、自动监督续跑和期限规则已被同进程常驻子会话替代。当前契约见 [Subagents](../subagents.md)，本文件及下列旧验收只保留历史依据，不能用来证明当前实现已覆盖相同场景。
+
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 已实施并完成验收；定向自动验证及 gpt-5.5 / low 的真实 A01–A04 场景通过 |
+| 状态 | 跨窗功能原验收已完成；当前执行与通知协议已按超时监督规范更新，本轮验证另见监督实施报告 |
 | 日期 | 2026-09-26 |
 | 适用范围 | `packages/coding-agent` 的子任务交接、Context Rollover、print/json 运行生命周期 |
 | 目标 | 已返回任务 ID 的子 Agent 即使仍在运行或取消中，也不再因等待其终态而阻止主 Agent 换窗 |
 | 本轮交付 | 交接协议、统一门禁、请求正文覆盖、print/json 续跑、相关回归与[实施评估报告](subagent-context-rollover-implementation-report.md) |
 
 用户已确认实施。相关代码改造、定向自动验证与本文要求的真实主/子 Agent 场景验收已完成。实现范围、成功证据、此前失败尝试与适用限制见实施评估报告。
+
+上述验收描述的是原跨窗改造。当前协议同时遵守[超时监督规范](subagent-timeout-supervision.md)：同一宿主 Session 管理独立 worker，有限监督授权允许父任务续跑。当前改动的验证见[监督实施报告](subagent-timeout-supervision-implementation-report.md)，不能用原验收代替。
 
 ## 1. 问题与决策
 
@@ -40,7 +44,7 @@
 
 ### 2.1 本次范围
 
-- 同一进程、同一 AgentSession、同一分支内的上下文换窗。
+- 同一宿主、同一 AgentSession、同一分支内的上下文换窗；子 Agent 在受监督独立 worker 中执行。
 - 内置 `task` 工具创建的 `kind=subagent` 任务。
 - 后台委派，以及前台等待超时后已经返回任务 ID 的子任务。
 - 运行中、取消中、已完成但尚未读取结果的任务引用。
@@ -73,7 +77,7 @@
 | S08 | 原任务的 ownerSessionId/rootPromptId 不因父窗口改变而重绑；不能依赖可缺省的 rootPromptId 判断分支归属 |
 | S09 | 交接材料计入真实请求预算与恢复覆盖；分页不能静默丢弃引用 |
 | S10 | 用户取消、待确认交互、工具事务、请求预算、恢复来源、版本比较、dispatch journal 等门禁继续有效 |
-| S11 | 子任务完成不自动启动新一轮主 Agent 调用，不自动重试或重复执行业务动作 |
+| S11 | 只有仍有效的一次性监督授权可续跑原父任务；普通完成没有无条件唤醒权，不自动重试或重复执行业务动作 |
 | S12 | print/json 不得在换窗与续跑的间隙提前 dispose，也不得为了完成换窗等待已交接子任务终态 |
 | S13 | 当前需交接任务的原委派正文、父任务关系和结果处理步骤必须进入恢复后的实际 provider request；ID、短描述、来源链接或读过某工具均不能替代正文覆盖 |
 | S14 | 历史引用清单不等于当前待办清单；不因任务已终态就删除其待处理关系，也不因保留历史引用就重新执行已处理任务 |
@@ -84,6 +88,8 @@
 ### 4.1 权威来源与引用集合
 
 在父工具批次完整后，从当前 Session 分支的真实 `task` 委派记录中提取任务 ID，按 taskId 去重并保持首次委派顺序。
+
+`task_control(action=replace)` 的后继使用真实控制调用与已完成的 `subagent-control-result` 作为规范来源，保留原 delegation 及原委派约束。旧 taskId 保持原终态，新 taskId 单独进入恢复目录；不能只改提示文字冒充有效来源。
 
 来源必须与 History 的规范来源保持一致。当前 History 会优先使用 `tool_result_source`，并排除同 toolCallId 的重复 message/toolResult；不能机械地把被排除的 message entryId 当成可读历史引用。
 
@@ -161,14 +167,14 @@ interface SubagentContinuationRef {
 
 ### 4.4 结果读取与进程重启
 
-换窗不直接把子任务所有输出塞入新上下文，也不创建自动通知队列。结果留在原 TaskManager 中，由新窗口主动查询。
+换窗不直接把子任务所有输出塞入新上下文。原 TaskManager 保留结果及监督事件；新窗口通过有界报告、结果和证据分页查询。自动通知与父续跑严格使用超时监督规范的一次性授权及实际请求交付确认。
 
 重复查询允许返回相同结果；它不能重新运行子任务、重新应用 worktree 补丁或重复触发完成记账。本次不承诺模型业务行为的 exactly-once。
 
 本 spec 不提供跨进程恢复正在执行的任务。恢复持久化引用时：
 
 - 引用真实性由原始委派来源验证，不能要求 live registry 一定存在才承认历史记录。
-- 如果进程已重启、TaskManager 没有原 ID，须把查询得到的 `not found` 解释为当前 runtime 缺少句柄，不能据此宣称子任务真实执行失败、仍在运行或成功。
+- 如果宿主已重启、TaskManager 没有原执行句柄，已存监督记录返回 `execution_handle_missing` 与未知状态，不能据此宣称子任务真实执行失败、仍在运行或成功；没有记录的任意 ID 返回未找到。
 - 已保存的历史结果仍可通过 History 查阅；不得自动重建任务、重放副作用或假造终态。
 - 不为兼容旧交接协议增加双轨恢复路径。新增字段及对应规范随本次实现统一更新；历史委派来源仍复用当前 History 读取规则。
 
@@ -249,6 +255,7 @@ type ContextTransitionGate =
 
 - 对已交接 subagent，不再调用无期限 `awaitSettled` 作为换窗续跑前提。
 - 仍需等待正在发生的 Session continuation，不能把两次调度之间的短暂 idle 当作最终退出。
+- 普通模型轮次结束后，只要仍有有效监督交付授权，Session 处于 awaiting，print/json 使用同一 `waitForIdle()` 等待其完成或被显式关闭。
 - print 只消费 Session 的裁决与生命周期状态，不自行重新准备换窗：`ready` 不等于可以退出，仍须等当前换窗续跑结束；`invalid` 输出原因并非零退出；`busy` 只等待实际阻挡项。不能因过滤后没有待等子任务就直接退出。
 - 保留非 subagent Task 和其他原有阻挡条件的处理；不能直接删除整段等待循环。
 - 如果共享 Session 已覆盖此生命周期，复用现有 `waitForIdle`；确有覆盖缺口时，仅在 Session 内补齐其换窗活动状态，不建立 print 专用调度器。
@@ -260,7 +267,7 @@ type ContextTransitionGate =
 | --- | --- |
 | 子任务始终不 resolve，主事件循环仍能运行 | 已返回委派结果后可换窗；新窗口确实执行一个无依赖业务动作；原任务仍是 running |
 | 子任务一直 cancelling | 可携带原 ID 换窗，不伪造 cancelled，也不宣称资源已释放 |
-| 子代码同步阻塞整个 Node 事件循环 | 本次不承诺可换窗；共享线程无法调度属于执行隔离问题，不能用本功能宣称已解决 |
+| 子代码同步阻塞 worker 事件循环 | 独立 worker 不阻塞父换窗；超时监督请求并确认停止。父宿主自身事件循环失效不在此保证内 |
 | 同批 `task` 与 `new_context` | 整批 tool results 完整后才捕获并校验；缺少新 ID 对应的关系 Note 时明确 invalid，不提交、不无限等；正常补齐后重新请求 |
 | 前台委派仍未返回 | 继续遵守前台工具等待；不得切开消息序列 |
 | 前台等待超时，已返回 ID | 按可交接子任务处理，等待超时不变成任务失败 |
@@ -296,8 +303,8 @@ type ContextTransitionGate =
 | `src/core/history.ts` | 优先复用现有规范来源和 toolCallId 索引；仅在缺少必要读取接口时做最小修改 | 不新建另一套历史来源选择规则 |
 | `src/modes/print-mode.ts` | 去除已交接 subagent 的终态等待，完整等待主 Session 换窗续跑 | 不绕过正常退出与 dispose |
 | `src/core/tools/context-window.ts` | 如有需要，准确说明完整父工具批次与后台任务的区别 | 不改变 new_context 的显式请求契约 |
-| `src/core/tasks/task-manager.ts`、`tasks/types.ts` | 主要核对既有生命周期可复用；仅必要的只读身份访问才修改 | 不重写取消、终态或等待实现，不添加任务总超时 |
-| `src/core/subagents/*`、`tools/task.ts`、`tools/get-task-output.ts` | 回归 taskId、执行配置、结构化结果、取消和查询；前台结构化结果正文补齐 taskId | 不修改执行方式；缺句柄事实解释不等于新增恢复任务功能 |
+| `src/core/tasks/task-manager.ts`、`tasks/types.ts` | 统一生命周期并保存监督状态 | 期限与控制由超时监督规范定义，查询等待不改变执行期限 |
+| `src/core/subagents/*`、`tools/task.ts`、`tools/get-task-output.ts` | 独立 worker、有界报告、停止与发布交接 | 缺句柄不重建执行；换窗不更换 worker 或刷新预算 |
 | `src/core/trace.ts`、`extensions/trace/index.ts` | 仅缺少验收可观测字段时补充分支/窗口/任务关联 | Trace 不能替代交接权威数据 |
 | `src/core/memory/*` | 检查 task 终态和原 rootPromptId 的归档不被改变 | 不因为成功换窗而提前归档整个业务任务，不改归档算法 |
 | `packages/agent` | `controlRequest` 增加最终 provider Context 参数；原工具批次与 PreparedContinuation 行为回归 | 首个业务请求可能被最终 transform 删除恢复正文，仅预算和指纹无法校验内容；只补齐该接口参数，不重写 Agent Loop |
@@ -307,18 +314,18 @@ type ContextTransitionGate =
 
 ## 8. 明确不做
 
-- 不添加子任务运行硬超时、心跳判活、强制杀进程、Worker/子进程 Runner。
+- 换窗本身不调整期限、不创建 worker；执行上限和进程停止遵守超时监督规范，不用心跳推断进展。
 - 不因等待超时或换窗自动取消、重试、重派、降级模型。
 - 不移除完整工具批次、用户交互、预算、来源校验或 dispatch journal。
 - 不把 running/cancelling 改成虚假的终态以通过门禁。
-- 不自动唤醒主模型来消费完成事件，不增加结果消费确认工具或通用消息总线。
+- 不在监督授权之外自动唤醒主模型，不增加结果消费确认工具或通用消息总线。
 - 不依赖模型自由摘要或隐含记忆恢复委派；不把旧对话全文、所有历史任务正文和全部子任务输出无差别塞入新窗口。
 - 不新增通用语义判定器或结果消费账本，不把正文已送达宣称为模型一定理解正确。
 - 不承诺结果读取一次就等于业务副作用 exactly-once。
 - 不引入旧行为兼容开关、第二套 rollover 或第二个 TaskManager。
 - 不实现跨进程运行恢复，不扩大 subagent 深度和工具权限。
 - 不改后台 bash/lsp/diagnostics 的换窗语义，不改 provider 重试或网络策略。
-- 不顺带修复已存在的取消后迟到补丁竞态、重写 worktree 事务或增加全局文件锁；不能宣称本次提供这些保证。
+- worktree 停止确认、冻结产物、发布资格与取消竞争遵守超时监督规范；不增加全局文件锁或通用回滚保证。
 - 不改依赖和 lockfile，不运行未经请求的 build，不提交代码。
 
 ## 9. 建议实施顺序
@@ -477,6 +484,6 @@ A04 必须检查以下内容，不能只检查最终回复包含某个任务 ID�
 7. 相关规范与 changelog 一致，最终 diff 仅包含必要模块、测试和文档。
 8. 提供本次验收报告与证据路径，之后才把本 spec 改为已验收。
 
-用户已确认本 spec 的语义变更与实现范围：**允许已交接子 Agent 跨主上下文窗口存活，保留其他 Task 的当前规则；补齐身份、委派正文、父任务关系、结果处理步骤的强制恢复及命令行生命周期；不增加强制终止、自动重试或跨进程恢复。**
+原跨窗改造的确认范围为：**允许已交接子 Agent 跨主上下文窗口存活，保留其他 Task 的当前规则；补齐身份、委派正文、父任务关系、结果处理步骤的强制恢复及命令行生命周期。** 后续监督规范增加独立执行和停止保证；不提供自动重试或跨宿主重启恢复。
 
 累计 163 项 coding-agent 定向测试、67 项 Agent 核心测试通过，`npm run check` 退出码为 0。2026-09-26 使用用户指定的 `rrver/gpt-5.5`、`low`：真实 SDK、text/json、真实工具慢任务与历史任务语义处理均成功；text 首轮发现的前台结果正文缺少 ID 已修复并回归。按用户要求将临时 SDK 单请求期限提高至 10 分钟、两项补测整场期限提高至 30 分钟后，取消场景 9/9、前台已完成但未消费结果的跨窗场景 21/21 通过，均有正常最终回复。A01–A04 验收证据齐全，生产超时和重试策略未改；此前超时、失败及完整证据保留在实施报告中。

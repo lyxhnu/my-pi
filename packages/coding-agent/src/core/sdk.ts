@@ -15,6 +15,9 @@ import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import { type RootSubagentOptions, RootSubagentSession } from "./subagents/root-session.ts";
+import type { SubagentRunScope } from "./subagents/run-scope.ts";
+import { SubagentError, type SubagentPermission } from "./subagents/types.ts";
 import { time } from "./timings.ts";
 import {
 	createBashTool,
@@ -36,6 +39,12 @@ import { createDefaultWebSearchOperations, type WebSearchOperations } from "./to
 setDefaultStreamFn(streamSimple);
 
 export interface CreateAgentSessionOptions {
+	/** In-process delegation is enabled for persistent roots by default. false disables delegation. */
+	subagents?: RootSubagentOptions | false;
+	/** Bound by the in-process child factory, never by model tool arguments. */
+	subagentRunScope?: SubagentRunScope;
+	/** Host-bound child capability; never accepted from model tool arguments. */
+	subagentPermission?: () => SubagentPermission;
 	/** Working directory for project-local discovery. Default: process.cwd() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
@@ -63,7 +72,7 @@ export interface CreateAgentSessionOptions {
 	 * Optional allowlist of tool names.
 	 *
 	 * When omitted, pi uses AgentSession's canonical default tool set (coding tools plus internal
-	 * orchestration tools such as task/get_task_output/kill_task) and leaves extension/custom tools enabled
+	 * orchestration tools such as spawn_agent/wait_agent/get_task_output) and leaves extension/custom tools enabled
 	 * unless `noTools` changes that default.
 	 * When provided, only the listed tool names are enabled.
 	 */
@@ -171,6 +180,8 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	if (options.subagents && options.subagentRunScope) throw new Error("root_and_child_scope_conflict");
+	let subagentRunScope = options.subagentRunScope;
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
@@ -181,6 +192,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	if (sessionManager.getHeader()?.ownership?.kind === "root" && options.subagents === false)
+		throw new SubagentError("root_coordinator_required");
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -189,8 +202,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	// Check if session has existing data to restore
-	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
+	let existingSession = sessionManager.buildSessionContext();
+	let hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
 	let model = options.model;
@@ -251,158 +264,192 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
 	// Leave this undefined when the caller did not select a tool policy. AgentSession owns the canonical
 	// default list; duplicating the legacy four-tool list here silently disabled every later internal tool
-	// (including task/get_task_output/kill_task) in the real CLI even though direct AgentSession tests passed.
+	// (including collaboration tools) in the real CLI even though direct AgentSession tests passed.
 	const initialActiveToolNames: string[] | undefined = options.tools
 		? [...options.tools].filter((name) => !excludedToolNameSet?.has(name))
 		: options.noTools
 			? []
 			: undefined;
 
-	let agent: Agent;
-
-	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
-	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
-		// Check setting dynamically so mid-session changes take effect
-		if (!settingsManager.getBlockImages()) {
-			return converted;
-		}
-		// Filter out ImageContent from all messages, replacing with text placeholder
-		return converted.map((msg) => {
-			if (msg.role === "user" || msg.role === "toolResult") {
-				const content = msg.content;
-				if (Array.isArray(content)) {
-					const hasImages = content.some((c) => c.type === "image");
-					if (hasImages) {
-						const filteredContent = content
-							.map((c) =>
-								c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
-							)
-							.filter(
-								(c, i, arr) =>
-									// Dedupe consecutive "Image reading is disabled." texts
-									!(
-										c.type === "text" &&
-										c.text === "Image reading is disabled." &&
-										i > 0 &&
-										arr[i - 1].type === "text" &&
-										(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
-									),
-							);
-						return { ...msg, content: filteredContent };
-					}
-				}
-			}
-			return msg;
-		});
-	};
-
-	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-
-	agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			tools: [],
-		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
-			// Use max int32 to effectively disable the timeout.
-			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
-			const websocketConnectTimeoutMs =
-				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
-			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
-				...options,
-				timeoutMs,
-				websocketConnectTimeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				transformHeaders: async (requestHeaders) => {
-					const headers = mergeProviderAttributionHeaders(
-						model,
-						settingsManager,
-						options?.sessionId,
-						requestHeaders,
-					);
-					return headerRunner?.hasHandlers("before_provider_headers")
-						? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-						: (headers ?? {});
-				},
-			});
-		},
-		onPayload: async (payload, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
-			}
-			return runner.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
-			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
-		},
-		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
-		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
-		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-		appendOnlyContext: settingsManager.getAppendOnlyContext(),
-	});
-
-	// Restore messages if session has existing data
-	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
-		if (!hasThinkingEntry) {
-			sessionManager.appendThinkingLevelChange(thinkingLevel);
-		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
+	const subagentRoot =
+		!subagentRunScope && options.subagents !== false && (sessionManager.isPersisted() || options.subagents)
+			? await RootSubagentSession.open({
+					...(options.subagents || {}),
+					rootSession: sessionManager,
+					rootResources: resourceLoader,
+					agentDir,
+					modelRuntime,
+					model: () => {
+						if (!model) throw new Error("root_model_unavailable");
+						return model;
+					},
+					thinkingLevel: () => thinkingLevel,
+					settings: () => settingsManager,
+				})
+			: undefined;
+	if (subagentRoot) {
+		subagentRunScope = subagentRoot.scope;
+		// Recovery may have appended interrupted tool results. Restore that durable
+		// context, never the snapshot taken before operation recovery.
+		existingSession = sessionManager.buildSessionContext();
+		hasExistingSession = existingSession.messages.length > 0;
 	}
 
-	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd,
-		scopedModels: options.scopedModels,
-		resourceLoader,
-		customTools: options.customTools,
-		webSearchOperations: options.webSearchOperations ?? createDefaultWebSearchOperations(),
-		modelRuntime,
-		initialActiveToolNames,
-		allowedToolNames,
-		excludedToolNames,
-		extensionRunnerRef,
-		sessionStartEvent: options.sessionStartEvent,
-	});
-	const extensionsResult = resourceLoader.getExtensions();
+	try {
+		let agent: Agent;
 
-	return {
-		session,
-		extensionsResult,
-		modelFallbackMessage,
-	};
+		// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
+		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+			const converted = convertToLlm(messages);
+			// Check setting dynamically so mid-session changes take effect
+			if (!settingsManager.getBlockImages()) {
+				return converted;
+			}
+			// Filter out ImageContent from all messages, replacing with text placeholder
+			return converted.map((msg) => {
+				if (msg.role === "user" || msg.role === "toolResult") {
+					const content = msg.content;
+					if (Array.isArray(content)) {
+						const hasImages = content.some((c) => c.type === "image");
+						if (hasImages) {
+							const filteredContent = content
+								.map((c) =>
+									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+								)
+								.filter(
+									(c, i, arr) =>
+										// Dedupe consecutive "Image reading is disabled." texts
+										!(
+											c.type === "text" &&
+											c.text === "Image reading is disabled." &&
+											i > 0 &&
+											arr[i - 1].type === "text" &&
+											(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
+										),
+								);
+							return { ...msg, content: filteredContent };
+						}
+					}
+				}
+				return msg;
+			});
+		};
+
+		const extensionRunnerRef: { current?: ExtensionRunner } = {};
+
+		agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				tools: [],
+			},
+			convertToLlm: convertToLlmWithBlockImages,
+			streamFn: async (model, context, options) => {
+				subagentRunScope?.assertActive();
+				const providerRetrySettings = settingsManager.getProviderRetrySettings();
+				const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+				// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
+				// Use max int32 to effectively disable the timeout.
+				const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+				const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
+				const websocketConnectTimeoutMs =
+					options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+				const headerRunner = extensionRunnerRef.current;
+				return modelRuntime.streamSimple(model, context, {
+					...options,
+					timeoutMs,
+					websocketConnectTimeoutMs,
+					maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+					maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+					transformHeaders: async (requestHeaders) => {
+						const headers = mergeProviderAttributionHeaders(
+							model,
+							settingsManager,
+							options?.sessionId,
+							requestHeaders,
+						);
+						return headerRunner?.hasHandlers("before_provider_headers")
+							? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+							: (headers ?? {});
+					},
+				});
+			},
+			onPayload: async (payload, _model) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner?.hasHandlers("before_provider_request")) {
+					return payload;
+				}
+				return runner.emitBeforeProviderRequest(payload);
+			},
+			onResponse: async (response, _model) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner?.hasHandlers("after_provider_response")) {
+					return;
+				}
+				await runner.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
+			},
+			sessionId: sessionManager.getSessionId(),
+			transformContext: async (messages) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner) return messages;
+				return runner.emitContext(messages);
+			},
+			steeringMode: settingsManager.getSteeringMode(),
+			followUpMode: settingsManager.getFollowUpMode(),
+			transport: settingsManager.getTransport(),
+			thinkingBudgets: settingsManager.getThinkingBudgets(),
+			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+			appendOnlyContext: settingsManager.getAppendOnlyContext(),
+		});
+
+		// Restore messages if session has existing data
+		if (hasExistingSession) {
+			agent.state.messages = existingSession.messages;
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial model and thinking level for new sessions so they can be restored on resume
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
+			sessionManager.appendThinkingLevelChange(thinkingLevel);
+		}
+
+		const session = new AgentSession({
+			subagentRoot,
+			subagentRunScope,
+			subagentPermission: subagentRoot ? () => subagentRoot.permission : options.subagentPermission,
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd,
+			scopedModels: options.scopedModels,
+			resourceLoader,
+			collaborationTools: subagentRoot?.tools,
+			customTools: options.customTools,
+			webSearchOperations: options.webSearchOperations ?? createDefaultWebSearchOperations(),
+			modelRuntime,
+			initialActiveToolNames,
+			allowedToolNames,
+			excludedToolNames,
+			extensionRunnerRef,
+			sessionStartEvent: options.sessionStartEvent,
+		});
+		const extensionsResult = resourceLoader.getExtensions();
+
+		return {
+			session,
+			extensionsResult,
+			modelFallbackMessage,
+		};
+	} catch (error) {
+		await subagentRoot?.close();
+		throw error;
+	}
 }

@@ -140,7 +140,9 @@ describe("decideToolPermission — unknown/custom tools", () => {
 describe("classifyToolEffect", () => {
 	it("classifies built-in network, process, write, and read effects", () => {
 		expect(classifyToolEffect("web_fetch")).toBe("network");
-		expect(classifyToolEffect("task")).toBe("process");
+		expect(classifyToolEffect("bash")).toBe("process");
+		expect(classifyToolEffect("spawn_agent")).toBe("session");
+		expect(classifyToolEffect("interrupt_agent")).toBe("session");
 		expect(classifyToolEffect("edit")).toBe("workspace-write");
 		expect(classifyToolEffect("memory_search")).toBe("read");
 	});

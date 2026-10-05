@@ -29,14 +29,14 @@ An initial tool result is `pending`. After the whole batch and selected steering
 
 Identical same-batch requests merge; conflicting targets are rejected. User model/thinking selections and cancellation invalidate pending requests. Interrupted uncommitted requests are cancelled on restore. Committed selections are restored with the session.
 
-Children capture the parent's model, thinking level, and upgrade policy at spawn. Each child then has independent observations and upgrade state. Its changes do not affect parents or siblings. Child upgrade events are forwarded into the parent's trace with a task ID, including when the child later fails or is cancelled.
+Children capture the parent's model, thinking level, and upgrade policy when their session is initialized. Each child then has independent observations and upgrade state. Its changes do not affect parents or siblings. Child upgrade events and actual request headers are persisted in that child's session trace; use the subagent identity's session file to inspect them. Explicit followups retain that child's profile.
 
 Inspect `/trace` in interactive mode, or retrieve session entries over RPC:
 
 - `execution/status`: observations and whether a review reminder was included.
 - `execution/upgrade`: `pending`, `applied`, `rejected`, or `cancelled`, including target, reason, call IDs, and request fingerprint after application.
 - The subsequent `request/header`: actual provider, model, and reasoning passed to the stream function.
-- `task/request`: the corresponding actual child request header, associated with its task and child session. Parent request headers remain separate.
+- Child session `request/header`: the actual child request profile, separate from the root's request headers.
 
 Committed changes also emit extension `model_select` (source `upgrade`) and `thinking_level_select` events.
 

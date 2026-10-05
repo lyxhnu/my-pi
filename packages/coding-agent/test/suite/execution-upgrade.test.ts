@@ -1,7 +1,11 @@
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { createAgentSession } from "../../src/core/sdk.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
+import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 describe("agent-owned execution upgrades", () => {
@@ -331,71 +335,58 @@ describe("agent-owned execution upgrades", () => {
 		expect(h.session.model?.id).toBe("small");
 	});
 
-	it("lets a child inherit reasoning, upgrade itself, and report trace without changing its parent", async () => {
-		const h = await setup({
-			initialActiveToolNames: ["task", "get_task_output", "kill_task", "upgrade_execution"],
-			settings: {
-				executionUpgrade: { enabled: true, modelOrder: ["faux/small", "faux/large"] },
-				permissions: { allow: [{ pattern: "task:*" }] },
-				compaction: { enabled: false },
-			},
+	it("lets a persistent child upgrade its own model and trace without changing its parent", async () => {
+		const h = await setup();
+		const { session: root } = await createAgentSession({
+			cwd: h.tempDir,
+			agentDir: h.tempDir,
+			modelRuntime: h.session.modelRuntime,
+			model: h.getModel(),
+			thinkingLevel: "medium",
+			settingsManager: h.settingsManager,
+			resourceLoader: createTestResourceLoader(),
+			sessionManager: SessionManager.create(h.tempDir, join(h.tempDir, "managed")),
+			tools: ["spawn_agent", "wait_agent", "upgrade_execution"],
 		});
-		h.session.setThinkingLevel("medium");
-		h.setResponses([
-			fauxAssistantMessage(
-				fauxToolCall("task", {
-					description: "analyze",
-					prompt: "analyze",
-					subagent_type: "explore",
-					run_in_background: false,
-				}),
-				{ stopReason: "toolUse" },
-			),
-			(_context, options, _state, model) => {
-				expect(model.id).toBe("small");
-				expect((options as SimpleStreamOptions).reasoning).toBe("medium");
-				return fauxAssistantMessage(upgrade(), { stopReason: "toolUse" });
-			},
-			(_context, options, _state, model) => {
-				expect(model.id).toBe("large");
-				expect((options as SimpleStreamOptions).reasoning).toBe("high");
-				return fauxAssistantMessage(
-					fauxToolCall("submit_subagent_result", {
-						status: "completed",
-						summary: "analyzed",
-						findings: [],
-						changes: [],
-						verification: [],
-					}),
-					{ stopReason: "toolUse" },
+		try {
+			h.setResponses([
+				(_context, options, _state, model) => {
+					expect(model.id).toBe("small");
+					expect((options as SimpleStreamOptions).reasoning).toBe("medium");
+					return fauxAssistantMessage(upgrade(), { stopReason: "toolUse" });
+				},
+				(_context, options, _state, model) => {
+					expect(model.id).toBe("large");
+					expect((options as SimpleStreamOptions).reasoning).toBe("high");
+					return fauxAssistantMessage("analyzed");
+				},
+			]);
+			await root.subagents!.run(async () => {
+				const host = root.subagents!,
+					caller = host.coordinator.callerFor(host.scope.assertActive().runId);
+				const run = await host.coordinator.spawn(
+					caller,
+					{ task: "analyze", context: "none", permission: { mode: "read-only" } },
+					"analysis",
 				);
-			},
-			fauxAssistantMessage("done"),
-		]);
-		await h.session.prompt("delegate analysis");
-		expect(h.session.model?.id).toBe("small");
-		expect(h.session.thinkingLevel).toBe("medium");
-		expect(h.eventsOfType("execution_upgrade").filter((event) => event.outcome.status === "applied")).toEqual([
-			expect.objectContaining({ taskId: expect.any(String) }),
-		]);
-		const childHeaders = h.sessionManager
-			.getEntries()
-			.flatMap((entry) => (entry.type === "trace" && entry.event.type === "task/request" ? [entry.event.data] : []));
-		expect(childHeaders.map(({ header }) => [header.model, header.reasoning])).toEqual([
-			["small", "medium"],
-			["large", "high"],
-		]);
-		expect(new Set(childHeaders.map(({ taskId }) => taskId)).size).toBe(1);
-		expect(
-			h.sessionManager
-				.getEntries()
-				.some(
-					(entry) =>
-						entry.type === "trace" &&
-						entry.event.type === "execution/upgrade" &&
-						entry.event.data.taskId &&
-						entry.event.data.outcome.status === "applied",
-				),
-		).toBe(true);
+				expect((await host.coordinator.wait(caller, run.runId, { timeoutMs: 3000 })).run.state).toBe("completed");
+				const child = host.factory.getSession(run.agentId)!;
+				expect(child.model?.id).toBe("large");
+				expect(child.thinkingLevel).toBe("high");
+				const headers = child.sessionManager
+					.getEntries()
+					.flatMap((entry) =>
+						entry.type === "trace" && entry.event.type === "request/header" ? [entry.event.data.header] : [],
+					);
+				expect(headers.map((header) => [header.model, header.reasoning])).toEqual([
+					["small", "medium"],
+					["large", "high"],
+				]);
+			});
+			expect(root.model?.id).toBe("small");
+			expect(root.thinkingLevel).toBe("medium");
+		} finally {
+			await root.dispose();
+		}
 	});
 });

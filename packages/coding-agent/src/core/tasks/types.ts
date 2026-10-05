@@ -1,11 +1,13 @@
 /** Long-running work tracked by one TaskManager. */
-export type TaskKind = "bash" | "subagent" | "diagnostics" | "lsp";
+export type TaskKind = "bash" | "diagnostics" | "lsp";
 export type TaskArchiveRole = "dependency" | "service";
 
 export type TaskStatus = "running" | "cancelling" | "completed" | "blocked" | "failed" | "cancelled";
 
 interface TaskSnapshotBase {
 	taskId: string;
+	/** Host-issued subagent execution identity; absent for unmanaged sessions. */
+	runId?: string;
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
@@ -29,6 +31,7 @@ export type TaskSnapshot<TResult = unknown> = TaskSnapshotBase &
 
 export interface TaskRunContext {
 	taskId: string;
+	runId?: string;
 	signal: AbortSignal;
 	/** Append a chunk of output while the run is active. */
 	appendOutput: (chunk: string) => void;
@@ -39,6 +42,8 @@ export type TaskRunResult<TResult = unknown> =
 	| { status: "blocked"; result: TResult; errorMessage: string };
 
 export interface TaskStartRequest<TResult = unknown> {
+	/** Reserved by a coordinator before asynchronous setup begins. */
+	taskId?: string;
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
@@ -60,6 +65,7 @@ export interface TaskOutputPage {
 export interface TaskWaitOptions {
 	/** Milliseconds to wait for completion. 0/undefined = non-blocking snapshot. */
 	timeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 export interface TaskWaitResult {
@@ -70,6 +76,7 @@ export interface TaskWaitResult {
 
 export interface TaskStateTransition {
 	taskId: string;
+	runId?: string;
 	kind: TaskKind;
 	ownerSessionId?: string;
 	rootPromptId?: string;
